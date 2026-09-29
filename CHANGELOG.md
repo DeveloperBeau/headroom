@@ -284,6 +284,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **code:** fix two `CodeAwareCompressor` AST-reassembly bugs: an exported JS/TS function or class (`export function foo() {`) produced a duplicated `export export` keyword and invalid syntax, because line-based node slicing (used to preserve indentation) pulled in the preceding `export` sibling's text on top of the `export_statement` handler's own prefix reconstruction. Separately, in every supported language, a doc comment immediately above a top-level function, class, or type was detached from its declaration during extraction and re-emitted in a cluster at the end of the compressed output instead of staying attached to what it documents.
 - * **proxy:** Buffered upstream responses containing a `server_tool_use` (or any other unrecognized Anthropic content block) no longer turn a fully-generated response into an HTTP 502. `StreamingMixin._response_to_sse` raised `ValueError` on unknown block types after the entire upstream generation had already been buffered, so a slow-but-successful response failed and the client retried the whole multi-minute request. Unknown blocks are now emitted verbatim in `content_block_start` (following the existing redacted_thinking` pattern), so `server_tool_use`, `server_tool_result`, `mcp_tool_use`, and future block types round-trip ([#1806](https://github.com/headroomlabs-ai/headroom/issues/1806)).
 
+## [0.39.2](https://github.com/headroomlabs-ai/headroom/compare/v0.39.1...v0.39.2) (2026-09-29)
+
+
+### Bug Fixes
+
+* **ccr:** answer headroom_retrieve on the direct chat path instead of forwarding it ([#3816](https://github.com/headroomlabs-ai/headroom/issues/3816)) ([126e144](https://github.com/headroomlabs-ai/headroom/commit/126e144876d2bd01246b5066dd5d3379b7a0e2da))
+* **ccr:** inject headroom_retrieve before the prefix is warm, not after ([#3810](https://github.com/headroomlabs-ai/headroom/issues/3810)) ([bb8c285](https://github.com/headroomlabs-ai/headroom/commit/bb8c285714b19dadf4f96305ba5a74877a0dd103))
+* **ccr:** unwrap Hermes batched tool_call so headroom_retrieve stays exempt ([#3839](https://github.com/headroomlabs-ai/headroom/issues/3839)) ([2f07668](https://github.com/headroomlabs-ai/headroom/commit/2f076687b069f09c69a1ce3e6f3eaaa521b838f7))
+* **ci:** keep hard watchdog out of pytest shards ([#3845](https://github.com/headroomlabs-ai/headroom/issues/3845)) ([2527431](https://github.com/headroomlabs-ai/headroom/commit/25274310ca396aaf5761d78d07106de3dfde2951))
+* **cli:** honor CODEX_HOME and align wrap/init/doctor with the live proxy port ([#3855](https://github.com/headroomlabs-ai/headroom/issues/3855)) ([5bf6612](https://github.com/headroomlabs-ai/headroom/commit/5bf661232667fe2573caafcd9b48f86c6388b5bd))
+* **install:** parse Windows Task Scheduler XML output ([#3830](https://github.com/headroomlabs-ai/headroom/issues/3830)) ([c32a4f4](https://github.com/headroomlabs-ai/headroom/commit/c32a4f4131934dee48d793156fb8a536a4b2617e))
+* **log_compressor:** keep and name pytest short-summary failures ([#3828](https://github.com/headroomlabs-ai/headroom/issues/3828)) ([d90b320](https://github.com/headroomlabs-ai/headroom/commit/d90b32008dc47f25737d9cef8da942fd8dc1af76))
+* make Headroom work behind Zscaler and other TLS-inspecting networks ([#3831](https://github.com/headroomlabs-ai/headroom/issues/3831)) ([66258c4](https://github.com/headroomlabs-ai/headroom/commit/66258c40a4589bb2fef934dec6fb69c527ae8b44))
+* **memory:** align project routing with wrap headers ([#3603](https://github.com/headroomlabs-ai/headroom/issues/3603)) ([b1b005a](https://github.com/headroomlabs-ai/headroom/commit/b1b005a9a867d75cbc6b459b1f5276c272e7ac50))
+* **memory:** avoid injecting tools into tool-free requests ([#3677](https://github.com/headroomlabs-ai/headroom/issues/3677)) ([46755b5](https://github.com/headroomlabs-ai/headroom/commit/46755b5f72804c32dc7d6ded5595342a2cac6157))
+* **memory:** pin LF on memory writers and guard the learn-writer newline contract ([#3706](https://github.com/headroomlabs-ai/headroom/issues/3706)) ([b10dd8d](https://github.com/headroomlabs-ai/headroom/commit/b10dd8db6e71903e550edd1707ce044f3520f0b4))
+* **pricing:** add Claude Sonnet 5.5 / Opus 5.5 / Fable 5.1, correct Sonnet 5 rates ([#3841](https://github.com/headroomlabs-ai/headroom/issues/3841)) ([0d99c56](https://github.com/headroomlabs-ai/headroom/commit/0d99c56dc519c4684079a0e1107399068342104d))
+* **proxy:** forward operator-listed guarded upstreams through a proxy ([#3804](https://github.com/headroomlabs-ai/headroom/issues/3804)) ([4b7e5d2](https://github.com/headroomlabs-ai/headroom/commit/4b7e5d246e54b856af22cd1a90b47d93b26226cb))
+* **proxy:** gate the raw request body, not just its Content-Length header ([#3338](https://github.com/headroomlabs-ai/headroom/issues/3338)) ([c946b6b](https://github.com/headroomlabs-ai/headroom/commit/c946b6b0b0ae048c576940d1a57071b84cb05fb6))
+* **proxy:** hard watchdog that dumps and exits when a native call seizes the GIL ([#3180](https://github.com/headroomlabs-ai/headroom/issues/3180)) ([79daeb5](https://github.com/headroomlabs-ai/headroom/commit/79daeb590f46c8f74483e975647c202d09f01fbb))
+* **proxy:** reap wrap-spawned proxies once no wrap clients remain ([#3202](https://github.com/headroomlabs-ai/headroom/issues/3202)) ([4227bd2](https://github.com/headroomlabs-ai/headroom/commit/4227bd2419e72a922149d5dfaf416808d8e08139))
+* **proxy:** run extension middleware inside the security gate and body ceiling ([#3847](https://github.com/headroomlabs-ai/headroom/issues/3847)) ([1854fd7](https://github.com/headroomlabs-ai/headroom/commit/1854fd7fd3f52bb4cc0b17803de0a04a850eb8f7))
+* **reporting:** price the savings tile instead of fabricating $0.00 ([#3821](https://github.com/headroomlabs-ai/headroom/issues/3821)) ([f519fa8](https://github.com/headroomlabs-ai/headroom/commit/f519fa8b97aa9ccef369f5973f1d476af2a65edf))
+* **rust-proxy:** forward request paths verbatim and pin the rustls provider ([#3853](https://github.com/headroomlabs-ai/headroom/issues/3853)) ([9d98ea5](https://github.com/headroomlabs-ai/headroom/commit/9d98ea59082ca6b00be2508f00b85ef90c94f744))
+* **sdk:** stop JSON-wrapping structured tool_result content in the Anthropic adapter ([#3797](https://github.com/headroomlabs-ai/headroom/issues/3797)) ([2e4a60a](https://github.com/headroomlabs-ai/headroom/commit/2e4a60ae3730fc7ea8f5afebbc29961d5fd0af11))
+* **smart-crusher:** recurse at adaptive array limit ([#3770](https://github.com/headroomlabs-ai/headroom/issues/3770)) ([7790bde](https://github.com/headroomlabs-ai/headroom/commit/7790bdeebda290b9fdbf899df1cbf9a05e0bc5e9))
+* **wrap:** never reuse a non-Headroom listener on the proxy port ([#3799](https://github.com/headroomlabs-ai/headroom/issues/3799)) ([3ffa57e](https://github.com/headroomlabs-ai/headroom/commit/3ffa57ec25a6f05dff073c0ad0b14c90ce264fd8))
+* **wrap:** never reuse a proxy with incompatible routing config ([#3201](https://github.com/headroomlabs-ai/headroom/issues/3201)) ([f69e246](https://github.com/headroomlabs-ai/headroom/commit/f69e2463a0c29cea7943af5efe4b2a2170a1e863))
+
+
+### Dependencies
+
+* bump pyjwt 2.13.0 -&gt; 2.15.1 for CVE-2026-102274 ([#3861](https://github.com/headroomlabs-ai/headroom/issues/3861)) ([37b9c46](https://github.com/headroomlabs-ai/headroom/commit/37b9c46069f11a2b2a477ae4ef25dd33bf359684))
+
+
+### Code Refactoring
+
+* **wrap:** generate goose/openhands/openclaude from a WrapTarget registry ([#3800](https://github.com/headroomlabs-ai/headroom/issues/3800)) ([de4cf7e](https://github.com/headroomlabs-ai/headroom/commit/de4cf7e7a1ece51ce6c60d25bc34f46897e972c9))
+
 ## [0.39.1](https://github.com/headroomlabs-ai/headroom/compare/v0.39.0...v0.39.1) (2026-09-26)
 
 
