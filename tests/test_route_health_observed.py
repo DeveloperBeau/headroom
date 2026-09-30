@@ -123,6 +123,32 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
         await deliver(health, "/responses", [b'data: {"text":"response.completed message_stop"}\n\n'])
         self.assertEqual(health.snapshot()["codex"]["last_reason"], "missing_terminal_event")
 
+    async def test_short_disconnects_do_not_poison_health_but_stalls_do(self):
+        clock = Clock()
+        health = RouteHealth(clock=clock)
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"text/event-stream")]})
+            await receive()
+
+        async def receive():
+            clock.now += gap
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            pass
+
+        middleware = RouteHealthMiddleware(app, health)
+        for gap in (1, 1, 1):
+            await middleware({"type": "http", "method": "POST", "path": "/responses"}, receive, send)
+        self.assertEqual(health.snapshot()["codex"]["state"], "unknown")
+        for gap in (61, 61, 61):
+            await middleware({"type": "http", "method": "POST", "path": "/responses"}, receive, send)
+        self.assertEqual(health.snapshot()["codex"]["state"], "unhealthy")
+        self.assertEqual(health.snapshot()["codex"]["last_reason"], "interrupted")
+        self.assertEqual(health.snapshot()["codex"]["active_requests"], 0)
+
     async def test_repeated_failures_trigger_unhealthy_then_expire(self):
         clock = Clock()
         health = RouteHealth(clock=clock)

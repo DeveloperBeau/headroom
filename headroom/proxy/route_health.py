@@ -170,6 +170,14 @@ class RouteHealthMiddleware:
         max_gap_ms = 0
         event_tail = b""
         raised: BaseException | None = None
+        client_disconnected = False
+
+        async def observe_receive() -> dict:
+            nonlocal client_disconnected
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                client_disconnected = True
+            return message
 
         async def observe_send(message: dict) -> None:
             nonlocal status, is_sse, complete, terminal, error_event
@@ -203,7 +211,7 @@ class RouteHealthMiddleware:
             await send(message)
 
         try:
-            await self.app(scope, receive, observe_send)
+            await self.app(scope, observe_receive, observe_send)
         except BaseException as exc:
             raised = exc
             raise
@@ -217,6 +225,8 @@ class RouteHealthMiddleware:
                 reason = f"http_{status}"
             elif error_event:
                 reason = "sse_error"
+            elif client_disconnected and not terminal:
+                reason = "interrupted"
             elif not complete or (is_sse and not terminal):
                 reason = "missing_terminal_event"
             else:
@@ -236,7 +246,8 @@ class RouteHealthMiddleware:
             }
             # Short client cancellations are routine. Keep metrics, but do not
             # declare the provider unhealthy unless the stream stalled first.
-            if reason != "interrupted" or (idle_ms is not None and idle_ms >= 60_000):
+            quiet_ms = idle_ms if idle_ms is not None else round((ended - started) * 1000)
+            if reason != "interrupted" or quiet_ms >= 60_000:
                 self.health.record(route, success, reason, stream)
             log = logger.info if success else logger.warning
             log(
