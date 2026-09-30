@@ -22,6 +22,8 @@ class OpenAIImageEndpoint:
 OPENAI_IMAGE_ENDPOINTS: tuple[OpenAIImageEndpoint, ...] = (
     OpenAIImageEndpoint("/v1/images/generations", "images/generations"),
     OpenAIImageEndpoint("/v1/images/edits", "images/edits"),
+    OpenAIImageEndpoint("/images/generations", "images/generations"),
+    OpenAIImageEndpoint("/images/edits", "images/edits"),
 )
 
 

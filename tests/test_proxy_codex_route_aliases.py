@@ -20,6 +20,78 @@ def _jwt(payload: dict) -> str:
     return f"{encode(header)}.{encode(payload)}."
 
 
+@pytest.mark.parametrize("sub_path", ["generations", "edits"])
+@pytest.mark.parametrize("auth_source", ["account_header", "jwt"])
+def test_bare_image_aliases_use_codex_backend_and_preserve_auth_and_body(sub_path, auth_source):
+    class FakeAsyncClient:
+        def __init__(self):
+            self.calls = []
+
+        async def request(self, method, url, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return httpx.Response(200, json={"ok": True})
+
+        async def aclose(self):
+            return None
+
+    token = (
+        _jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-image"}})
+        if auth_source == "jwt"
+        else "oauth-image-token"
+    )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/octet-stream",
+        "Accept-Encoding": "gzip",
+        "X-Headroom-Bypass": "true",
+    }
+    if auth_source == "account_header":
+        headers["ChatGPT-Account-ID"] = "acct-image"
+    body = b"\xffopaque-image\x00"
+    app = create_app(ProxyConfig(optimize=False, disable_kompress=True))
+    with TestClient(app) as client:
+        fake = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake
+        client.app.state.proxy.http_client_h1 = fake
+        response = client.post(f"/images/{sub_path}?trace=alias", headers=headers, content=body)
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert len(fake.calls) == 1
+    method, url, kwargs = fake.calls[0]
+    assert method == "POST"
+    assert url == f"https://chatgpt.com/backend-api/codex/images/{sub_path}?trace=alias"
+    upstream_headers = {key.lower(): value for key, value in kwargs["headers"].items()}
+    assert upstream_headers["authorization"] == f"Bearer {token}"
+    assert upstream_headers["chatgpt-account-id"] == "acct-image"
+    assert upstream_headers["content-type"] == "application/octet-stream"
+    assert not {"host", "accept-encoding", "x-headroom-bypass"} & upstream_headers.keys()
+    assert kwargs["content"] == body
+
+
+@pytest.mark.parametrize("sub_path", ["generations", "edits"])
+def test_bare_image_aliases_keep_api_key_requests_on_openai(sub_path, monkeypatch):
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):
+        return JSONResponse({"base_url": base_url, "sub_path": sub_path, "provider": provider_name})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+    app = create_app(
+        ProxyConfig(optimize=False, disable_kompress=True, openai_api_url="https://api.openai.test")
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            f"/images/{sub_path}",
+            headers={"Authorization": "Bearer sk-image-test"},
+            content=b"image-request",
+        )
+    assert response.status_code == 200
+    assert response.json() == {
+        "base_url": "https://api.openai.test",
+        "sub_path": f"images/{sub_path}",
+        "provider": "openai",
+    }
+
+
 def test_codex_responses_aliases_delegate_to_openai_handler(monkeypatch):
     async def fake_handle(self, request):  # type: ignore[no-untyped-def]
         return JSONResponse({"ok": True, "path": request.url.path})
