@@ -2977,14 +2977,20 @@ async def _read_request_body_bytes(request: Request) -> bytes:
                 f"(Content-Length: {declared})"
             )
 
-    chunks = bytearray()
-    async for chunk in request.stream():
-        chunks.extend(chunk)
-        if len(chunks) > MAX_REQUEST_BODY_SIZE:
-            raise RequestBodyTooLarge(
-                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
-            )
-    raw: bytes = bytes(chunks)
+    raw = getattr(request, "_body", None)
+    if raw is None:
+        chunks = bytearray()
+        async for chunk in request.stream():
+            chunks.extend(chunk)
+            if len(chunks) > MAX_REQUEST_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+                )
+        raw = bytes(chunks)
+    elif len(raw) > MAX_REQUEST_BODY_SIZE:
+        raise RequestBodyTooLarge(
+            f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+        )
     # Cache like Starlette's own body() would, so any other .body() caller on
     # this request (there is none today, but future callers get the same
     # semantics) sees the bytes already read rather than a consumed stream.

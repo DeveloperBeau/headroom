@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -77,25 +78,24 @@ def test_responses_bypass_skips_memory_and_compression_mutation() -> None:
         memory_handler = _MemoryHandler()
         proxy.memory_handler = memory_handler
 
-        async def _fake_retry(
-            method: str,
-            url: str,
-            headers: dict[str, str],
-            body: dict[str, Any],
-            stream: bool = False,
-            **kwargs: Any,
-        ) -> httpx.Response:
-            captured["body"] = body
+        async def _fake_send(request: httpx.Request, **kwargs: Any) -> httpx.Response:
+            captured["body"] = json.loads(await request.aread())
             return httpx.Response(
                 200,
-                json={
-                    "id": "resp_1",
-                    "output": [],
-                    "usage": {"input_tokens": 10, "output_tokens": 1},
-                },
+                headers={"content-type": "application/json"},
+                stream=httpx.ByteStream(
+                    json.dumps(
+                        {
+                            "id": "resp_1",
+                            "output": [],
+                            "usage": {"input_tokens": 10, "output_tokens": 1},
+                        }
+                    ).encode()
+                ),
+                request=request,
             )
 
-        proxy._retry_request = _fake_retry
+        proxy.http_client.send = _fake_send
 
         response = client.post(
             "/v1/responses",

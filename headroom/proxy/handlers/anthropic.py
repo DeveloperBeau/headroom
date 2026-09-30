@@ -911,11 +911,14 @@ class AnthropicHandlerMixin:
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
             _get_image_compressor,
             compute_turn_id,
             read_request_json_with_bytes,
         )
+        from headroom.proxy.large_request_body import prepare_raw_body
         from headroom.proxy.modes import is_cache_mode, is_token_mode
+        from headroom.proxy.raw_forwarding import forward_raw, raw_forwarding_allowed
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -1035,8 +1038,29 @@ class AnthropicHandlerMixin:
             stage_timer.record("pre_upstream_wait", 0.0)
             _pre_upstream_saturated = False
 
+        can_forward_raw = (
+            upstream_base_url is None
+            and provider_name == "anthropic"
+            and model_override is None
+            and not force_stream
+            and raw_forwarding_allowed(self, "messages")
+        )
         try:
-            # Check request body size
+            if can_forward_raw:
+                raw = await prepare_raw_body(request)
+                if raw is not None:
+                    _release_pre_upstream_sem()
+                    return await forward_raw(
+                        self,
+                        request,
+                        route="messages",
+                        body=raw.content,
+                        content_length=raw.content_length,
+                        request_id=request_id,
+                        reason=raw.reason,
+                    )
+            # Provider wrappers that translate body/model fields retain their
+            # bounded processing path; raw forwarding cannot perform translation.
             content_length = request.headers.get("content-length")
             if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
                 return JSONResponse(
@@ -1060,6 +1084,28 @@ class AnthropicHandlerMixin:
             try:
                 async with stage_timer.measure("read_request_json"):
                     body, original_body_bytes = await read_request_json_with_bytes(request)
+            except RequestBodyTooLarge as e:
+                if can_forward_raw:
+                    _release_pre_upstream_sem()
+                    return await forward_raw(
+                        self,
+                        request,
+                        route="messages",
+                        body=request._body,
+                        content_length=len(request._body),
+                        request_id=request_id,
+                        reason="decompressed_size",
+                    )
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": f"Invalid request body: {e!s}",
+                        },
+                    },
+                )
             except (json.JSONDecodeError, ValueError) as e:
                 return JSONResponse(
                     status_code=400,

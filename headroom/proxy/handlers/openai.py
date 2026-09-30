@@ -5533,9 +5533,11 @@ class OpenAIHandlerMixin:
 
         from headroom.proxy.body_forwarding import BodyMutationTracker
         from headroom.proxy.helpers import (
-            MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
             read_request_json_with_bytes,
         )
+        from headroom.proxy.large_request_body import prepare_raw_body
+        from headroom.proxy.raw_forwarding import forward_raw, raw_forwarding_allowed
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -5549,18 +5551,17 @@ class OpenAIHandlerMixin:
         request.state.auth_mode = auth_mode
         logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
 
-        # Check request body size
-        content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
-            return JSONResponse(
-                status_code=413,
-                content={
-                    "error": {
-                        "message": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB",
-                        "type": "invalid_request_error",
-                        "code": "request_too_large",
-                    }
-                },
+        can_forward_raw = raw_forwarding_allowed(self, "responses")
+        raw = await prepare_raw_body(request) if can_forward_raw else None
+        if raw is not None:
+            return await forward_raw(
+                self,
+                request,
+                route="responses",
+                body=raw.content,
+                content_length=raw.content_length,
+                request_id=request_id,
+                reason=raw.reason,
             )
 
         # Parse request. Keep the original (post-content-decoding) bytes so a
@@ -5570,6 +5571,30 @@ class OpenAIHandlerMixin:
         # (#1542); byte-faithful passthrough avoids that.
         try:
             body, original_body_bytes = await read_request_json_with_bytes(request)
+        except RequestBodyTooLarge as error:
+            if not can_forward_raw:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "error": {
+                            "message": str(error),
+                            "type": "invalid_request_error",
+                            "code": "request_too_large",
+                        }
+                    },
+                )
+            # The bounded decoder stopped before materializing a compressed
+            # upload beyond the optimization budget. Forward its original wire
+            # bytes and encoding; do not inflate or parse it again.
+            return await forward_raw(
+                self,
+                request,
+                route="responses",
+                body=request._body,
+                content_length=len(request._body),
+                request_id=request_id,
+                reason="decompressed_size",
+            )
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
