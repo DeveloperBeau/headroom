@@ -3161,7 +3161,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     route_health = RouteHealth()
     app.state.route_health = route_health
-    app.add_middleware(RouteHealthMiddleware, health=route_health)
     app.add_middleware(WebSocketProjectPrefixMiddleware)
     loop_health_state: LoopHealthState = {
         "status": "healthy",
@@ -5696,6 +5695,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     register_provider_routes(app, proxy)
 
+    # Observe the outer ASGI boundary: BaseHTTPMiddleware security gates can
+    # consume client disconnects before inner streaming handlers receive them.
+    app.add_middleware(RouteHealthMiddleware, health=route_health)
     return app
 
 

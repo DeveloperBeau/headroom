@@ -1,5 +1,6 @@
 import importlib.metadata
 import importlib.util
+import asyncio
 import os
 import unittest
 from unittest.mock import patch
@@ -82,6 +83,50 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
         app = create_app(ProxyConfig(optimize=False, cache_enabled=False))
         self.assertIsInstance(app.state.route_health, RouteHealth)
         self.assertIn("/health/routes", {route.path for route in app.routes})
+        self.assertIs(app.user_middleware[0].cls, RouteHealthMiddleware)
+
+    async def test_disconnect_consumed_by_security_gate_is_observed(self):
+        from fastapi import FastAPI
+        from starlette.responses import StreamingResponse
+
+        app = FastAPI()
+        health = RouteHealth()
+
+        @app.middleware("http")
+        async def security_gate(request, call_next):
+            return await call_next(request)
+
+        @app.post("/responses")
+        async def response():
+            async def stream():
+                yield b"event: response.created\ndata: {}\n\n"
+                await asyncio.sleep(10)
+            return StreamingResponse(stream(), media_type="text/event-stream")
+
+        app.add_middleware(RouteHealthMiddleware, health=health)
+        disconnected = asyncio.Event()
+        first = True
+
+        async def receive():
+            nonlocal first
+            if first:
+                first = False
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                disconnected.set()
+
+        await asyncio.wait_for(app({
+            "type": "http", "method": "POST", "path": "/responses", "raw_path": b"/responses",
+            "query_string": b"", "headers": [], "http_version": "1.1", "scheme": "http",
+            "server": ("127.0.0.1", 8788), "client": ("127.0.0.1", 1234),
+            "asgi": {"version": "3.0", "spec_version": "2.0"},
+        }, receive, send), timeout=2)
+        self.assertEqual(health.snapshot()["codex"]["state"], "unknown")
+        self.assertEqual(health.snapshot()["codex"]["active_requests"], 0)
 
     async def test_readyz_reports_failed_codex_route(self):
         from fastapi.testclient import TestClient
