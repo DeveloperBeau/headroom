@@ -6,6 +6,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from headroom.providers.openai_responses import OPENAI_RESPONSES_ROOT_PATHS
@@ -13,7 +14,7 @@ from headroom.providers.openai_responses import OPENAI_RESPONSES_ROOT_PATHS
 logger = logging.getLogger("headroom.proxy")
 _WINDOW_SECONDS = 300
 _FAILURES_TO_UNHEALTHY = 3
-_TERMINAL_EVENTS = (b"response.completed", b"message_stop")
+_TERMINAL_EVENTS = (b"event: response.completed", b"event: message_stop")
 
 
 class ChunkTiming:
@@ -70,12 +71,32 @@ class RouteHealth:
             "codex": deque(maxlen=4096),
         }
         self._last_stream: dict[str, dict[str, Any] | None] = {"claude": None, "codex": None}
+        self._last_reason: dict[str, str | None] = {"claude": None, "codex": None}
+        self._last_observed_at: dict[str, str | None] = {"claude": None, "codex": None}
+        self._last_observed_monotonic: dict[str, float | None] = {"claude": None, "codex": None}
+        self._active: dict[str, dict[object, tuple[float, float]]] = {"claude": {}, "codex": {}}
+
+    def begin(self, route: str) -> object:
+        token = object()
+        now = self.clock()
+        self._active[route][token] = (now, now)
+        return token
+
+    def touch(self, route: str, token: object) -> None:
+        started, _ = self._active[route][token]
+        self._active[route][token] = (started, self.clock())
+
+    def end(self, route: str, token: object) -> None:
+        self._active[route].pop(token, None)
 
     def record(self, route: str, success: bool, reason: str, stream: dict[str, Any]) -> None:
         now = self.clock()
         outcomes = self._outcomes[route]
         outcomes.append((now, success, reason))
         self._last_stream[route] = stream
+        self._last_reason[route] = reason
+        self._last_observed_at[route] = datetime.now(timezone.utc).isoformat()
+        self._last_observed_monotonic[route] = now
         self._prune(outcomes, now)
 
     def _prune(self, outcomes: deque[tuple[float, bool, str]], now: float) -> None:
@@ -105,9 +126,21 @@ class RouteHealth:
                 "state": state,
                 "observations": len(outcomes),
                 "consecutive_failures": failures,
-                "last_reason": outcomes[-1][2] if outcomes else None,
-                "last_observed_seconds_ago": round(now - outcomes[-1][0], 3) if outcomes else None,
-                "last_stream": self._last_stream[route] if outcomes else None,
+                "last_reason": self._last_reason[route],
+                "last_observed_at": self._last_observed_at[route],
+                "last_observed_seconds_ago": round(now - self._last_observed_monotonic[route], 3)
+                if self._last_observed_monotonic[route] is not None
+                else None,
+                "last_stream": self._last_stream[route],
+                "active_requests": len(self._active[route]),
+                "oldest_active_seconds": round(
+                    max((now - started for started, _ in self._active[route].values()), default=0),
+                    3,
+                ),
+                "longest_active_idle_seconds": round(
+                    max((now - last for _, last in self._active[route].values()), default=0),
+                    3,
+                ),
             }
         return result
 
@@ -124,6 +157,7 @@ class RouteHealthMiddleware:
             return
 
         started = self.health.clock()
+        active_token = self.health.begin(route)
         status = 500
         is_sse = False
         complete = False
@@ -150,6 +184,7 @@ class RouteHealthMiddleware:
             elif message["type"] == "http.response.body":
                 body = message.get("body", b"")
                 if body:
+                    self.health.touch(route, active_token)
                     now = self.health.clock()
                     if first_byte_at is None:
                         first_byte_at = now
@@ -160,9 +195,10 @@ class RouteHealthMiddleware:
                     byte_count += len(body)
                     if is_sse:
                         window = event_tail + body
-                        terminal |= any(marker in window for marker in _TERMINAL_EVENTS)
-                        error_event |= b"event: error" in window
-                        event_tail = window[-32:]
+                        lines = window.splitlines()
+                        terminal |= any(line.strip() in _TERMINAL_EVENTS for line in lines)
+                        error_event |= any(line.strip() == b"event: error" for line in lines)
+                        event_tail = window[-64:]
                 complete = not message.get("more_body", False)
             await send(message)
 
@@ -172,6 +208,7 @@ class RouteHealthMiddleware:
             raised = exc
             raise
         finally:
+            self.health.end(route, active_token)
             ended = self.health.clock()
             idle_ms = round((ended - last_byte_at) * 1000) if last_byte_at is not None else None
             if raised is not None:

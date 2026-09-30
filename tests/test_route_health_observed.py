@@ -118,6 +118,11 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health.snapshot()["codex"]["state"], "healthy")
         self.assertEqual(health.snapshot()["claude"]["state"], "degraded")
 
+    async def test_terminal_words_in_generated_text_do_not_mark_success(self):
+        health = RouteHealth(clock=Clock())
+        await deliver(health, "/responses", [b'data: {"text":"response.completed message_stop"}\n\n'])
+        self.assertEqual(health.snapshot()["codex"]["last_reason"], "missing_terminal_event")
+
     async def test_repeated_failures_trigger_unhealthy_then_expire(self):
         clock = Clock()
         health = RouteHealth(clock=clock)
@@ -126,13 +131,32 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health.snapshot()["codex"]["state"], "unhealthy")
 
         clock.now += 301
-        self.assertEqual(health.snapshot()["codex"]["state"], "unknown")
+        expired = health.snapshot()["codex"]
+        self.assertEqual(expired["state"], "unknown")
+        self.assertEqual(expired["last_reason"], "sse_error")
+        self.assertEqual(expired["last_observed_seconds_ago"], 301)
+        self.assertIsNotNone(expired["last_observed_at"])
 
     async def test_high_request_volume_keeps_health_history_bounded(self):
         health = RouteHealth(clock=Clock())
         for _ in range(5000):
             health.record("codex", True, "completed", {})
         self.assertLessEqual(health.snapshot()["codex"]["observations"], 4096)
+
+    async def test_active_request_silence_is_visible_without_claiming_success(self):
+        clock = Clock()
+        health = RouteHealth(clock=clock)
+        token = health.begin("codex")
+        clock.now = 10
+        health.touch("codex", token)
+        clock.now = 310
+        snapshot = health.snapshot()["codex"]
+        self.assertEqual(snapshot["state"], "unknown")
+        self.assertEqual(snapshot["active_requests"], 1)
+        self.assertEqual(snapshot["oldest_active_seconds"], 310)
+        self.assertEqual(snapshot["longest_active_idle_seconds"], 300)
+        health.end("codex", token)
+        self.assertEqual(health.snapshot()["codex"]["active_requests"], 0)
 
     async def test_chunk_gap_is_recorded_without_payload(self):
         clock = Clock()
