@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import deque
@@ -10,11 +11,49 @@ from datetime import datetime, timezone
 from typing import Any
 
 from headroom.providers.openai_responses import OPENAI_RESPONSES_ROOT_PATHS
+from headroom.proxy.upstream_diagnostics import current_stream, diagnostics
 
 logger = logging.getLogger("headroom.proxy")
 _WINDOW_SECONDS = 300
 _FAILURES_TO_UNHEALTHY = 3
 _TERMINAL_EVENTS = (b"event: response.completed", b"event: message_stop")
+
+
+class LoopLagMonitor:
+    """Bounded, payload-free event-loop scheduling diagnostics."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self.clock = clock
+        self._samples: deque[tuple[float, int]] = deque(maxlen=60)
+        self._last_warning_at: float | None = None
+
+    def tick(self, expected_at: float) -> None:
+        now = self.clock()
+        lag_ms = round(max(0, now - expected_at) * 1000)
+        self._samples.append((now, lag_ms))
+        if lag_ms >= 1000 and (self._last_warning_at is None or now - self._last_warning_at >= 60):
+            self._last_warning_at = now
+            logger.warning("event=proxy_loop_lag lag_ms=%s", lag_ms)
+
+    def snapshot(self) -> dict[str, int | None]:
+        now = self.clock()
+        recent = [lag for observed_at, lag in self._samples if now - observed_at <= 60]
+        return {
+            "interval_ms": 1000,
+            "window_seconds": 60,
+            "samples": len(recent),
+            "last_lag_ms": self._samples[-1][1] if self._samples else None,
+            "max_lag_ms": max(recent) if recent else None,
+            "heartbeat_age_ms": round((now - self._samples[-1][0]) * 1000)
+            if self._samples
+            else None,
+        }
+
+    async def run(self) -> None:
+        while True:
+            expected_at = self.clock() + 1
+            await asyncio.sleep(1)
+            self.tick(expected_at)
 
 
 class ChunkTiming:
@@ -158,6 +197,17 @@ class RouteHealthMiddleware:
 
         started = self.health.clock()
         active_token = self.health.begin(route)
+        diagnostic = diagnostics.begin(
+            route,
+            client_port=(scope.get("client") or (None, None))[1],
+            http_version=scope.get("http_version"),
+        )
+        for name, value in scope.get("headers", ()):
+            if name.lower() == b"x-client-request-id":
+                if len(value) <= 64:
+                    diagnostic.bind_client_request_id(value.decode("ascii", errors="replace"))
+                break
+        context_token = current_stream.set(diagnostic)
         status = 500
         is_sse = False
         complete = False
@@ -177,6 +227,7 @@ class RouteHealthMiddleware:
             message = await receive()
             if message["type"] == "http.disconnect":
                 client_disconnected = True
+                diagnostic.mark_disconnected()
             return message
 
         async def observe_send(message: dict) -> None:
@@ -208,7 +259,14 @@ class RouteHealthMiddleware:
                         error_event |= any(line.strip() == b"event: error" for line in lines)
                         event_tail = window[-64:]
                 complete = not message.get("more_body", False)
-            await send(message)
+            diagnostic.wait_start("downstream_send")
+            try:
+                await send(message)
+            except BaseException as exc:
+                diagnostic.wait_end("downstream_send", exception=exc)
+                raise
+            else:
+                diagnostic.wait_end("downstream_send", size=len(message.get("body", b"")))
 
         try:
             await self.app(scope, observe_receive, observe_send)
@@ -216,6 +274,7 @@ class RouteHealthMiddleware:
             raised = exc
             raise
         finally:
+            current_stream.reset(context_token)
             self.health.end(route, active_token)
             ended = self.health.clock()
             idle_ms = round((ended - last_byte_at) * 1000) if last_byte_at is not None else None
@@ -249,11 +308,12 @@ class RouteHealthMiddleware:
             quiet_ms = idle_ms if idle_ms is not None else round((ended - started) * 1000)
             if reason != "interrupted" or quiet_ms >= 60_000:
                 self.health.record(route, success, reason, stream)
+            diagnostics.end(diagnostic, reason, exception=raised)
             log = logger.info if success else logger.warning
             log(
                 "event=route_stream_outcome route=%s reason=%s status=%s "
                 "chunks=%s bytes=%s first_byte_ms=%s max_gap_ms=%s "
-                "idle_at_end_ms=%s duration_ms=%s client_port=%s",
+                "idle_at_end_ms=%s duration_ms=%s client_port=%s record_id=%s request_id=%s",
                 route,
                 reason,
                 status,
@@ -264,4 +324,6 @@ class RouteHealthMiddleware:
                 idle_ms,
                 stream["duration_ms"],
                 (scope.get("client") or (None, None))[1],
+                diagnostic.key,
+                diagnostic.request_id,
             )

@@ -1,8 +1,9 @@
+import asyncio
 import importlib.metadata
 import importlib.util
-import asyncio
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from headroom.proxy.route_health import ChunkTiming, RouteHealth, RouteHealthMiddleware
@@ -101,6 +102,7 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
             async def stream():
                 yield b"event: response.created\ndata: {}\n\n"
                 await asyncio.sleep(10)
+
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         app.add_middleware(RouteHealthMiddleware, health=health)
@@ -119,17 +121,32 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
             if message["type"] == "http.response.body" and message.get("body"):
                 disconnected.set()
 
-        await asyncio.wait_for(app({
-            "type": "http", "method": "POST", "path": "/responses", "raw_path": b"/responses",
-            "query_string": b"", "headers": [], "http_version": "1.1", "scheme": "http",
-            "server": ("127.0.0.1", 8788), "client": ("127.0.0.1", 1234),
-            "asgi": {"version": "3.0", "spec_version": "2.0"},
-        }, receive, send), timeout=2)
+        await asyncio.wait_for(
+            app(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/responses",
+                    "raw_path": b"/responses",
+                    "query_string": b"",
+                    "headers": [],
+                    "http_version": "1.1",
+                    "scheme": "http",
+                    "server": ("127.0.0.1", 8788),
+                    "client": ("127.0.0.1", 1234),
+                    "asgi": {"version": "3.0", "spec_version": "2.0"},
+                },
+                receive,
+                send,
+            ),
+            timeout=2,
+        )
         self.assertEqual(health.snapshot()["codex"]["state"], "unknown")
         self.assertEqual(health.snapshot()["codex"]["active_requests"], 0)
 
     async def test_readyz_reports_failed_codex_route(self):
         from fastapi.testclient import TestClient
+
         from headroom.proxy.models import ProxyConfig
         from headroom.proxy.server import create_app
 
@@ -165,7 +182,9 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_terminal_words_in_generated_text_do_not_mark_success(self):
         health = RouteHealth(clock=Clock())
-        await deliver(health, "/responses", [b'data: {"text":"response.completed message_stop"}\n\n'])
+        await deliver(
+            health, "/responses", [b'data: {"text":"response.completed message_stop"}\n\n']
+        )
         self.assertEqual(health.snapshot()["codex"]["last_reason"], "missing_terminal_event")
 
     async def test_short_disconnects_do_not_poison_health_but_stalls_do(self):
@@ -173,8 +192,13 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
         health = RouteHealth(clock=clock)
 
         async def app(scope, receive, send):
-            await send({"type": "http.response.start", "status": 200,
-                        "headers": [(b"content-type", b"text/event-stream")]})
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/event-stream")],
+                }
+            )
             await receive()
 
         async def receive():
@@ -185,11 +209,15 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
             pass
 
         middleware = RouteHealthMiddleware(app, health)
-        for gap in (1, 1, 1):
-            await middleware({"type": "http", "method": "POST", "path": "/responses"}, receive, send)
+        for gap in (1, 1, 1):  # noqa: B007 - consumed by the receive closure
+            await middleware(
+                {"type": "http", "method": "POST", "path": "/responses"}, receive, send
+            )
         self.assertEqual(health.snapshot()["codex"]["state"], "unknown")
-        for gap in (61, 61, 61):
-            await middleware({"type": "http", "method": "POST", "path": "/responses"}, receive, send)
+        for gap in (61, 61, 61):  # noqa: B007 - consumed by the receive closure
+            await middleware(
+                {"type": "http", "method": "POST", "path": "/responses"}, receive, send
+            )
         self.assertEqual(health.snapshot()["codex"]["state"], "unhealthy")
         self.assertEqual(health.snapshot()["codex"]["last_reason"], "interrupted")
         self.assertEqual(health.snapshot()["codex"]["active_requests"], 0)
@@ -228,6 +256,101 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["longest_active_idle_seconds"], 300)
         health.end("codex", token)
         self.assertEqual(health.snapshot()["codex"]["active_requests"], 0)
+
+    async def test_diagnostics_expose_blocked_send_and_cancellation_without_payload(self):
+        from headroom.proxy import route_health
+        from headroom.proxy.server import HeadroomProxy
+        from headroom.proxy.upstream_diagnostics import StreamDiagnostics
+
+        clock = Clock()
+        diagnostics = StreamDiagnostics(clock=clock)
+        blocked = asyncio.Event()
+        counter = SimpleNamespace(_request_counter=0, _request_counter_lock=asyncio.Lock())
+
+        async def app(scope, receive, send):
+            await HeadroomProxy._next_request_id(counter)
+            await send({"type": "http.response.body", "body": b"private stream contents"})
+
+        async def receive():
+            return {"type": "http.request", "body": b""}
+
+        async def send(message):
+            blocked.set()
+            await asyncio.Event().wait()
+
+        middleware = RouteHealthMiddleware(app, RouteHealth(clock=clock))
+        with patch.object(route_health, "diagnostics", diagnostics, create=True):
+            task = asyncio.create_task(
+                middleware(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/responses",
+                        "client": ("127.0.0.1", 1234),
+                        "http_version": "1.1",
+                        "headers": [
+                            (b"x-client-request-id", b"036f2180-f5a9-4431-aa5b-3a6f2eabca9e"),
+                            (b"authorization", b"private-auth-value"),
+                        ],
+                    },
+                    receive,
+                    send,
+                )
+            )
+            try:
+                await asyncio.wait_for(blocked.wait(), timeout=1)
+                clock.now = 5
+                snapshot = diagnostics.snapshot()
+                self.assertEqual(len(snapshot["active"]), 1)
+                active = snapshot["active"][0]
+                self.assertRegex(active["request_id"], r"^hr_")
+                self.assertEqual(
+                    active.get("client_request_id"), "036f2180-f5a9-4431-aa5b-3a6f2eabca9e"
+                )
+                self.assertEqual(active["waits"]["downstream_send"]["active_ms"], 5000)
+                self.assertEqual(active["waits"]["downstream_send"]["bytes"], 0)
+                self.assertNotIn("private stream contents", str(snapshot))
+                self.assertNotIn("private-auth-value", str(snapshot))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        snapshot = diagnostics.snapshot()
+        self.assertEqual(snapshot["active"], [])
+        ended = snapshot["recent"][0]
+        self.assertEqual(ended["reason"], "interrupted")
+        self.assertEqual(ended["error"][0]["type"], "CancelledError")
+
+    async def test_diagnostics_record_disconnect_and_restore_request_context(self):
+        from headroom.proxy import route_health
+        from headroom.proxy.upstream_diagnostics import StreamDiagnostics, current_stream
+
+        diagnostics = StreamDiagnostics()
+
+        async def app(scope, receive, send):
+            self.assertIsNotNone(current_stream.get())
+            await send({"type": "http.response.body", "body": b"payload", "more_body": True})
+            await receive()
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            pass
+
+        before = current_stream.get()
+        with patch.object(route_health, "diagnostics", diagnostics, create=True):
+            await RouteHealthMiddleware(app, RouteHealth())(
+                {"type": "http", "method": "POST", "path": "/responses"},
+                receive,
+                send,
+            )
+        self.assertIs(current_stream.get(), before)
+        ended = diagnostics.snapshot()["recent"][0]
+        self.assertTrue(ended["disconnected"])
+        self.assertEqual(ended["waits"]["downstream_send"]["bytes"], 7)
 
     async def test_chunk_gap_is_recorded_without_payload(self):
         clock = Clock()

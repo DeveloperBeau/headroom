@@ -69,6 +69,7 @@ from typing import Any
 import httpcore
 import httpx
 
+from headroom.proxy.upstream_diagnostics import instrument_stream
 from headroom.proxy.upstream_guard import guarded_pin
 
 
@@ -119,13 +120,14 @@ class PinnedAddressBackend(httpcore.AsyncNetworkBackend):
         pin = guarded_pin(name)
 
         async def dial(target: str) -> httpcore.AsyncNetworkStream:
-            return await self._inner.connect_tcp(
+            stream = await self._inner.connect_tcp(
                 target,
                 port,
                 timeout=timeout,
                 local_address=local_address,
                 socket_options=socket_options,
             )
+            return instrument_stream(stream)
 
         if pin is None:
             # This request never had this destination checked -- an operator
@@ -161,9 +163,10 @@ class PinnedAddressBackend(httpcore.AsyncNetworkBackend):
         timeout: float | None = None,
         socket_options: Iterable[Any] | None = None,
     ) -> httpcore.AsyncNetworkStream:
-        return await self._inner.connect_unix_socket(
+        stream = await self._inner.connect_unix_socket(
             path, timeout=timeout, socket_options=socket_options
         )
+        return instrument_stream(stream)
 
     async def sleep(self, seconds: float) -> None:
         await self._inner.sleep(seconds)

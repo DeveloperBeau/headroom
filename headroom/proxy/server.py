@@ -40,6 +40,8 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 from urllib.parse import urlsplit
@@ -2363,9 +2365,15 @@ class HeadroomProxy(
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
+        from headroom.proxy.upstream_diagnostics import current_stream
+
         async with self._request_counter_lock:
             self._request_counter += 1
-            return f"hr_{int(time.time())}_{self._request_counter:06d}"
+            request_id = f"hr_{int(time.time())}_{self._request_counter:06d}"
+        diagnostic = current_stream.get()
+        if diagnostic is not None:
+            diagnostic.bind_request(request_id)
+        return request_id
 
     def _extract_tags(self, headers: dict) -> dict[str, str]:
         """Backwards-compat wrapper around :func:`extract_tags`.
@@ -3043,6 +3051,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.startup_error = None
         app.state.periodic_toin_stats_task = None
         app.state.periodic_malloc_trim_task = None
+        app.state.loop_lag_task = asyncio.create_task(
+            loop_lag.run(), name="headroom-event-loop-lag"
+        )
 
         try:
             try:
@@ -3108,6 +3119,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         exc,
                     )
 
+            loop_lag_task = app.state.loop_lag_task
+            if loop_lag_task is not None:
+                loop_lag_task.cancel()
+                await _timed(
+                    asyncio.gather(loop_lag_task, return_exceptions=True),
+                    label="loop_lag.stop",
+                    timeout=3.0,
+                )
+                app.state.loop_lag_task = None
+
             periodic_toin_stats_task = app.state.periodic_toin_stats_task
             if periodic_toin_stats_task is not None:
                 periodic_toin_stats_task.cancel()
@@ -3157,10 +3178,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
-    from headroom.proxy.route_health import RouteHealth, RouteHealthMiddleware
+    from headroom.proxy.route_health import LoopLagMonitor, RouteHealth, RouteHealthMiddleware
 
     route_health = RouteHealth()
+    loop_lag = LoopLagMonitor()
     app.state.route_health = route_health
+    app.state.loop_lag_task = None
+    diagnostic_libraries = {}
+    for package in ("httpx", "httpcore", "h2", "uvicorn", "starlette", "fastapi"):
+        try:
+            diagnostic_libraries[package] = package_version(package)
+        except PackageNotFoundError:
+            diagnostic_libraries[package] = None
     app.add_middleware(WebSocketProjectPrefixMiddleware)
     loop_health_state: LoopHealthState = {
         "status": "healthy",
@@ -3939,6 +3968,35 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "cc_switch_reconcile": _cc_reconciler is not None,
             "captured_upstream": getattr(_cc_reconciler, "current_upstream", None),
         }
+
+    @app.get("/debug/streams", dependencies=[Depends(_require_loopback)])
+    async def debug_streams():
+        """Bounded stream waits and safe runtime settings, without request content."""
+        from headroom.proxy.upstream_diagnostics import diagnostics
+
+        payload = diagnostics.snapshot()
+        payload.update(
+            pid=os.getpid(),
+            captured_at=_iso_utc_now(),
+            event_loop=loop_lag.snapshot(),
+            runtime={
+                **_runtime_payload(),
+                "python": sys.version.split()[0],
+                "libraries": diagnostic_libraries,
+                "http_client": {
+                    "http2_enabled": bool(config.http2 and not config.http_proxy),
+                    "proxy_configured": bool(config.http_proxy),
+                    "connect_timeout_seconds": config.connect_timeout_seconds,
+                    "read_timeout_seconds": config.request_timeout_seconds,
+                    "write_timeout_seconds": config.write_timeout_seconds,
+                    "pool_timeout_seconds": config.connect_timeout_seconds,
+                    "max_connections": config.max_connections,
+                    "max_keepalive_connections": config.max_keepalive_connections,
+                    "keepalive_expiry": config.keepalive_expiry,
+                },
+            },
+        )
+        return payload
 
     @app.get("/debug/tasks", dependencies=[Depends(_require_loopback)])
     async def debug_tasks(stack: bool = False):

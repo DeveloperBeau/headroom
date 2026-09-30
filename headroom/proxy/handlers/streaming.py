@@ -21,6 +21,7 @@ from headroom.proxy.helpers import (
 )
 from headroom.proxy.route_health import ChunkTiming
 from headroom.proxy.token_counting import gemini_output_tokens
+from headroom.proxy.upstream_diagnostics import current_stream
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -970,6 +971,9 @@ class StreamingMixin:
         # Open connection before generator to capture upstream response headers
         # (needed to forward ratelimit headers to the client via StreamingResponse)
         assert self.http_client is not None, "http_client must be initialized before streaming"
+        diagnostic = current_stream.get()
+        if diagnostic is not None:
+            diagnostic.bind_request(request_id)
         try:
             retry_attempts = max(1, getattr(self.config, "retry_max_attempts", 3))
             upstream_response = None
@@ -980,6 +984,9 @@ class StreamingMixin:
                     _upstream_req = self.http_client.build_request(
                         "POST", url, content=outbound_bytes, headers=outbound_headers
                     )
+                    if diagnostic is not None:
+                        diagnostic.start_attempt(attempt + 1, _upstream_req.extensions.get("timeout", {}))
+                        _upstream_req.extensions["trace"] = diagnostic.trace
                     upstream_response = await self.http_client.send(_upstream_req, stream=True)
                     if _codex_wire_debug:
                         capture_codex_wire_debug(
@@ -1009,12 +1016,20 @@ class StreamingMixin:
                             attempt,
                         )
                         await upstream_response.aclose()
+                        if diagnostic is not None:
+                            diagnostic.retry(delay_with_jitter)
                         logger.warning(
                             f"[{request_id}] Upstream {upstream_response.status_code} "
                             f"(attempt {attempt + 1}/{retry_attempts}), "
                             f"retrying in {delay_with_jitter:.0f}ms"
                         )
-                        await asyncio.sleep(delay_with_jitter / 1000)
+                        if diagnostic is not None:
+                            diagnostic.wait_start("retry")
+                        try:
+                            await asyncio.sleep(delay_with_jitter / 1000)
+                        finally:
+                            if diagnostic is not None:
+                                diagnostic.wait_end("retry")
                         continue
                     break
                 # Retry any transport-level failure while opening the upstream
@@ -1024,6 +1039,8 @@ class StreamingMixin:
                 # on a fresh connection is safe and avoids a 502. (#1639)
                 except httpx.TransportError as e:
                     last_connect_error = e
+                    if diagnostic is not None:
+                        diagnostic.observe_exception(e)
                     if attempt >= retry_attempts - 1:
                         raise
 
@@ -1032,15 +1049,25 @@ class StreamingMixin:
                         self.config.retry_max_delay_ms,
                         attempt,
                     )
+                    if diagnostic is not None:
+                        diagnostic.retry(delay_with_jitter)
                     logger.warning(
                         f"[{request_id}] Connection error to upstream API "
-                        f"(attempt {attempt + 1}/{retry_attempts}): {e!r}; "
+                        f"(attempt {attempt + 1}/{retry_attempts}): {type(e).__name__}; "
                         f"retrying in {delay_with_jitter:.0f}ms"
                     )
-                    await asyncio.sleep(delay_with_jitter / 1000)
+                    if diagnostic is not None:
+                        diagnostic.wait_start("retry")
+                    try:
+                        await asyncio.sleep(delay_with_jitter / 1000)
+                    finally:
+                        if diagnostic is not None:
+                            diagnostic.wait_end("retry")
 
             if upstream_response is None:
                 raise last_connect_error or RuntimeError("upstream connection did not start")
+            if diagnostic is not None:
+                diagnostic.response(upstream_response)
         # Retries exhausted (or a transport failure escaped the loop): emit a
         # clean SSE error instead of letting an h2 StreamReset bubble up as an
         # unhandled 502. Covers ConnectError/timeouts and Local/RemoteProtocol-
@@ -1253,7 +1280,10 @@ class StreamingMixin:
             try:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
-                    async for chunk in response.aiter_bytes():
+                    chunks = response.aiter_bytes()
+                    if diagnostic is not None:
+                        chunks = diagnostic.iter_chunks(chunks)
+                    async for chunk in chunks:
                         upstream_timing.chunk(len(chunk))
                         sse_chunk_index += 1
                         # Record TTFB on first chunk
@@ -1282,7 +1312,17 @@ class StreamingMixin:
 
                         # Always stream immediately — buffering breaks
                         # real-time clients (LangGraph, LangChain, etc.)
-                        yield chunk
+                        if diagnostic is not None:
+                            diagnostic.wait_start("downstream_yield")
+                        try:
+                            yield chunk
+                        except BaseException as error:
+                            if diagnostic is not None:
+                                diagnostic.wait_end("downstream_yield", exception=error)
+                            raise
+                        else:
+                            if diagnostic is not None:
+                                diagnostic.wait_end("downstream_yield", size=len(chunk))
 
                         if _codex_wire_debug:
                             capture_codex_wire_debug(
@@ -1423,7 +1463,9 @@ class StreamingMixin:
                 completed_normally = True
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-                logger.error(f"[{request_id}] Connection error to upstream API: {e}")
+                if diagnostic is not None:
+                    diagnostic.observe_exception(e)
+                logger.error(f"[{request_id}] Connection error to upstream API: {type(e).__name__}")
                 error_event = {
                     "type": "error",
                     "error": {
@@ -1433,11 +1475,15 @@ class StreamingMixin:
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except httpx.HTTPStatusError as e:
-                logger.error(f"[{request_id}] HTTP error from upstream API: {e}")
+                if diagnostic is not None:
+                    diagnostic.observe_exception(e)
+                logger.error(f"[{request_id}] HTTP error from upstream API: {type(e).__name__}")
                 # Forward the upstream error response
                 yield e.response.content
             except Exception as e:
-                logger.error(f"[{request_id}] Unexpected streaming error: {e}")
+                if diagnostic is not None:
+                    diagnostic.observe_exception(e)
+                logger.error(f"[{request_id}] Unexpected streaming error: {type(e).__name__}")
                 error_event = {
                     "type": "error",
                     "error": {"type": "api_error", "message": str(e)},

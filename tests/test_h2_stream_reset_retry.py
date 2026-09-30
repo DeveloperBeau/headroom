@@ -177,3 +177,51 @@ async def test_successful_stream_still_returns_200():
 
     assert result.status_code == 200
     proxy.metrics.record_upstream_connection_error.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stream_diagnostics_observe_retry_and_midstream_reset_without_changing_bytes():
+    import httpcore
+    from h2.events import StreamReset
+
+    from headroom.proxy.upstream_diagnostics import StreamDiagnostics, current_stream
+
+    registry = StreamDiagnostics()
+    record = registry.begin("claude")
+    token = current_stream.set(record)
+    proxy = _mock_proxy()
+    response = _good_stream_response([])
+    response.extensions = {"http_version": b"HTTP/2", "stream_id": 19}
+    payload = b'event: message_start\ndata: {"secret":"UNCHANGED"}\n\n'
+    cause = httpcore.RemoteProtocolError(StreamReset(stream_id=19, error_code=1, remote_reset=True))
+    reset = httpx.RemoteProtocolError("reset")
+    reset.__cause__ = cause
+
+    async def chunks():
+        yield payload
+        raise reset
+
+    response.aiter_bytes = chunks
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages",
+                            extensions={"timeout": {"read": 300}})
+    proxy.http_client.build_request = MagicMock(return_value=request)
+    proxy.http_client.send = AsyncMock(side_effect=[httpx.ConnectError("private secret"), response])
+    try:
+        result = await _run_stream(proxy)
+        body = b"".join([chunk async for chunk in result.body_iterator])
+        registry.end(record, "sse_error")
+    finally:
+        current_stream.reset(token)
+    assert body.startswith(payload)
+    assert b"event: error" in body
+    assert result.status_code == 200
+    assert proxy.http_client.send.await_count == 2
+    assert request.extensions["trace"] == record.trace
+    item = registry.snapshot()["recent"][0]
+    assert item["attempt"] == 2
+    assert item["stream_id"] == 19
+    assert item["waits"]["upstream_read"]["bytes"] == len(payload)
+    assert item["waits"]["downstream_yield"]["bytes"] == len(payload)
+    assert item["error"][1]["remote_reset"] is True
+    assert "secret" not in str(item)
+    response.aclose.assert_awaited_once()
