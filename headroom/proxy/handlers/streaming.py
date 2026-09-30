@@ -19,6 +19,7 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
     retry_after_ms,
 )
+from headroom.proxy.route_health import ChunkTiming
 from headroom.proxy.token_counting import gemini_output_tokens
 
 if TYPE_CHECKING:
@@ -1247,11 +1248,13 @@ class StreamingMixin:
             parsed_response = None  # Set by memory block; used by CCR + prefix tracker
             completed_normally = False
             pending_messages: list[dict] = []
+            upstream_timing = ChunkTiming()
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
                     async for chunk in response.aiter_bytes():
+                        upstream_timing.chunk(len(chunk))
                         sse_chunk_index += 1
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
@@ -1441,6 +1444,21 @@ class StreamingMixin:
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:
+                timing = upstream_timing.summary()
+                logger.info(
+                    "event=upstream_stream_timing request_id=%s provider=%s complete=%s "
+                    "chunks=%s bytes=%s first_byte_ms=%s max_gap_ms=%s "
+                    "idle_at_end_ms=%s duration_ms=%s",
+                    request_id,
+                    provider,
+                    completed_normally,
+                    timing["chunks"],
+                    timing["bytes"],
+                    timing["first_byte_ms"],
+                    timing["max_gap_ms"],
+                    timing["idle_at_end_ms"],
+                    timing["duration_ms"],
+                )
                 pending_messages = self._cleanup_mid_turn_stream(
                     session_key,
                     drain_pending_messages=completed_normally,

@@ -3157,6 +3157,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    from headroom.proxy.route_health import RouteHealth, RouteHealthMiddleware
+
+    route_health = RouteHealth()
+    app.state.route_health = route_health
+    app.add_middleware(RouteHealthMiddleware, health=route_health)
     app.add_middleware(WebSocketProjectPrefixMiddleware)
     loop_health_state: LoopHealthState = {
         "status": "healthy",
@@ -3432,13 +3437,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
+        routes = route_health.snapshot()
         # Kompress is an optional soft component: model downloads lazily on
         # first use, so "not ready" (cold cache) must not degrade overall health.
         ready = all(check["ready"] for name, check in checks.items() if name != "kompress")
+        ready = ready and all(route["state"] != "unhealthy" for route in routes.values())
         payload: dict[str, Any] = {
             "service": "headroom-proxy",
             "status": "healthy" if ready else "unhealthy",
             "ready": ready,
+            "routes": routes,
             "version": __version__,
             "timestamp": _iso_utc_now(),
             "uptime_seconds": _uptime_seconds(),
@@ -3851,6 +3859,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await _check_upstream()
         payload = _health_payload(include_config=False)
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
+
+    @app.get("/health/routes")
+    async def observed_route_health(request: Request):
+        if not _request_is_loopback(request):
+            raise HTTPException(status_code=404)
+        return route_health.snapshot()
 
     @app.get("/health")
     async def health(request: Request):
