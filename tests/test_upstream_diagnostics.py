@@ -3,6 +3,8 @@
 import asyncio
 import json
 import unittest
+from collections import deque
+from types import SimpleNamespace
 
 import httpcore
 import httpx
@@ -49,6 +51,33 @@ class FakeStream(httpcore.AsyncNetworkStream):
 
     def get_extra_info(self, name):
         return {"client_addr": ("127.0.0.1", 4321), "server_addr": ("192.0.2.1", 443)}.get(name)
+
+
+def h2_frame(kind, payload=b"", *, stream_id=0, flags=0):
+    return (
+        len(payload).to_bytes(3, "big")
+        + bytes((kind, flags))
+        + stream_id.to_bytes(4, "big")
+        + payload
+    )
+
+
+class FakeH2Stream(FakeStream):
+    def __init__(self, clock, chunks=(), alpn="h2"):
+        super().__init__(clock)
+        self.chunks = deque(chunks)
+        self.alpn = alpn
+
+    async def read(self, max_bytes, timeout=None):
+        await super().read(max_bytes, timeout)
+        return self.chunks.popleft() if self.chunks else b""
+
+    def get_extra_info(self, name):
+        if name == "ssl_object":
+            return SimpleNamespace(
+                selected_alpn_protocol=lambda: self.alpn, version=lambda: "TLSv1.3"
+            )
+        return super().get_extra_info(name)
 
 
 class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
@@ -256,8 +285,14 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                         )
                 if batch == 0:
                     self.registry.end(record, "sse_error")
+        settings = b"".join(
+            key.to_bytes(2, "big") + (2**32 - 1).to_bytes(4, "big")
+            for key in (1, 2, 3, 4, 5, 6, 8, 9)
+        )
+        wire = h2_frame(4, settings) * 32
         for _ in range(64):
-            InstrumentedStream(FakeStream(self.clock), self.registry)
+            stream = InstrumentedStream(FakeH2Stream(self.clock, [wire]), self.registry)
+            await stream.read(len(wire))
         data = json.dumps(self.registry.snapshot()).encode()
         self.assertLess(len(data), 2 * 1024 * 1024)
         self.assertNotIn(b"NEVER_LOG_THIS", data)
@@ -309,6 +344,227 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["connection_id"], stream.get_extra_info("headroom_connection_id"))
         self.assertEqual(failed["stream_id"], 11)
         self.assertEqual(failed["error"][0]["stream_id"], 11)
+
+    async def test_h2_controls_are_numeric_and_fragmented_frames_keep_boundaries(self):
+        settings = (
+            b"\x00\x03" + (100).to_bytes(4, "big") + b"\x00\x04" + (1048576).to_bytes(4, "big")
+        )
+        wire = (
+            h2_frame(4, settings)
+            + h2_frame(3, (1).to_bytes(4, "big"), stream_id=19)
+            + h2_frame(8, (1024).to_bytes(4, "big"))
+            + h2_frame(
+                7, (19).to_bytes(4, "big") + (1).to_bytes(4, "big") + b"PRIVATE GOAWAY reason"
+            )
+        )
+        chunks = [wire[:2], wire[2:11], wire[11:23], wire[23:]]
+        stream = InstrumentedStream(FakeH2Stream(self.clock, chunks), self.registry)
+        for chunk in chunks:
+            self.assertEqual(await stream.read(4096, 300), chunk)
+        connection = self.registry.snapshot()["connections"][0]
+        h2 = connection["http2"]
+        self.assertEqual(
+            h2["remote_settings"], {"max_concurrent_streams": 100, "initial_window_size": 1048576}
+        )
+        self.assertEqual(
+            h2["frame_counts"]["inbound"],
+            {"SETTINGS": 1, "RST_STREAM": 1, "WINDOW_UPDATE": 1, "GOAWAY": 1},
+        )
+        self.assertEqual(
+            h2["window_update_increments"]["inbound"], {"connection": 1024, "streams": 0}
+        )
+        reset = next(event for event in h2["recent_frames"] if event["type"] == 3)
+        self.assertEqual(
+            (reset["stream_id"], reset["error_code"], reset["direction"]), (19, 1, "inbound")
+        )
+        goaway = h2["recent_frames"][-1]
+        self.assertEqual(
+            (goaway["last_stream_id"], goaway["error_code"], goaway["debug_data_length"]),
+            (19, 1, len(b"PRIVATE GOAWAY reason")),
+        )
+        self.assertEqual(h2["buffered_bytes"], 0)
+        self.assertNotIn("PRIVATE", json.dumps(connection))
+
+    async def test_h2_outbound_preface_fragments_and_coalesced_frames_are_not_rewritten(self):
+        wire = (
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+            + h2_frame(4, b"\x00\x02\x00\x00\x00\x00")
+            + h2_frame(1, b"PRIVATE authorization header", stream_id=1, flags=4)
+            + h2_frame(0, b"PRIVATE request body", stream_id=1, flags=1)
+            + h2_frame(8, (500).to_bytes(4, "big"), stream_id=1)
+            + h2_frame(99, b"PRIVATE extension")
+        )
+        chunks = [wire[:1], wire[1:12], wire[12:29], wire[29:]]
+        inner = FakeH2Stream(self.clock)
+        stream = InstrumentedStream(inner, self.registry)
+        for chunk in chunks:
+            await stream.write(chunk, 150)
+        self.assertEqual(inner.calls, [("write", chunk, 150) for chunk in chunks])
+        h2 = self.registry.snapshot()["connections"][0]["http2"]
+        self.assertEqual(h2["local_settings"], {"enable_push": 0})
+        self.assertEqual(
+            h2["frame_counts"]["outbound"],
+            {"SETTINGS": 1, "HEADERS": 1, "DATA": 1, "WINDOW_UPDATE": 1, "UNKNOWN": 1},
+        )
+        self.assertEqual(h2["data_payload_bytes"]["outbound"], len(b"PRIVATE request body"))
+        self.assertEqual(
+            h2["window_update_increments"]["outbound"], {"connection": 0, "streams": 500}
+        )
+        self.assertNotIn("PRIVATE", json.dumps(h2))
+
+    async def test_h2_large_sensitive_payloads_and_control_metadata_stay_bounded(self):
+        payload = b"PRIVATE_TOKEN_HEADER_BODY" * 50000
+        settings = b"\x00\x04\x00\x00\x10\x00" * 10000
+        wire = (
+            h2_frame(0, payload, stream_id=1)
+            + h2_frame(1, payload, stream_id=1)
+            + h2_frame(99, payload)
+            + h2_frame(4, settings)
+            + h2_frame(7, (1).to_bytes(4, "big") + (0).to_bytes(4, "big") + payload)
+        )
+        chunks = [wire[i : i + 32768] for i in range(0, len(wire), 32768)]
+        stream = InstrumentedStream(FakeH2Stream(self.clock, chunks), self.registry)
+        for chunk in chunks:
+            self.assertEqual(await stream.read(32768), chunk)
+            self.assertLessEqual(
+                self.registry.snapshot()["connections"][0]["http2"]["buffered_bytes"], 256
+            )
+        h2 = self.registry.snapshot()["connections"][0]["http2"]
+        self.assertEqual(h2["data_payload_bytes"]["inbound"], len(payload))
+        self.assertEqual(h2["metadata_omitted_frames"], 1)
+        self.assertEqual(h2["remote_settings"], {})
+        self.assertEqual(h2["recent_frames"][-1]["debug_data_length"], len(payload))
+        self.assertNotIn("PRIVATE", json.dumps(h2))
+        self.assertLess(len(json.dumps(h2)), 4096)
+
+    async def test_h2_event_ring_and_unknown_type_counters_are_bounded(self):
+        wire = b"".join(h2_frame(kind, b"PRIVATE") for kind in range(256))
+        stream = InstrumentedStream(FakeH2Stream(self.clock, [wire]), self.registry)
+        await stream.read(len(wire))
+        h2 = self.registry.snapshot()["connections"][0]["http2"]
+        self.assertLessEqual(len(h2["recent_frames"]), 32)
+        self.assertLessEqual(len(h2["frame_counts"]["inbound"]), 11)
+        self.assertEqual(h2["frame_counts"]["inbound"]["UNKNOWN"], 246)
+        self.assertNotIn("PRIVATE", json.dumps(h2))
+
+    async def test_h2_partial_frame_reports_metadata_without_retaining_payload(self):
+        wire = h2_frame(0, b"PRIVATE BODY", stream_id=7, flags=1)
+        stream = InstrumentedStream(FakeH2Stream(self.clock, [wire[:12]]), self.registry)
+        await stream.read(4096)
+        h2 = stream.state.snapshot()["http2"]
+        self.assertEqual(h2["buffered_bytes"], 0)
+        self.assertEqual(
+            h2["pending_frames"][0]["remaining_payload_bytes"], len(b"PRIVATE BODY") - 3
+        )
+        self.assertEqual(h2["pending_frames"][0]["stream_id"], 7)
+        self.assertNotIn("PRIVATE", json.dumps(h2))
+
+    async def test_h2_observer_failure_disables_only_observation(self):
+        wire = h2_frame(4)
+        stream = InstrumentedStream(FakeH2Stream(self.clock, [wire, wire]), self.registry)
+        await stream.read(4096)
+
+        def broken_observer(data):
+            raise ValueError("PRIVATE observer bug")
+
+        observer = stream.state.http2_observers["inbound"]
+        observer.feed = broken_observer
+        self.assertEqual(await stream.read(4096), wire)
+        h2 = stream.state.snapshot()["http2"]
+        self.assertEqual(h2["observer_errors"], 1)
+        self.assertTrue(observer.disabled)
+        self.assertNotIn("PRIVATE", json.dumps(h2))
+
+    async def test_settings_cache_follows_connection_across_requests_and_retries(self):
+        from h2.events import RemoteSettingsChanged
+        from h2.settings import ChangedSetting, SettingCodes
+
+        stream = InstrumentedStream(FakeH2Stream(self.clock), self.registry)
+        self.record.start_attempt(1, {})
+        await self.record.trace("connection.start_tls.complete", {"return_value": stream})
+        settings = RemoteSettingsChanged()
+        settings.changed_settings[SettingCodes.INITIAL_WINDOW_SIZE] = ChangedSetting(
+            SettingCodes.INITIAL_WINDOW_SIZE, 65535, 1048576
+        )
+        await self.record.trace(
+            "http2.receive_remote_settings.complete", {"return_value": settings}
+        )
+        reused = self.registry.begin("codex")
+        reused.response(httpx.Response(200, extensions={"network_stream": stream}))
+        self.assertEqual(reused.snapshot()["http2_settings"], {"initial_window_size": 1048576})
+        self.assertEqual(
+            self.registry.snapshot()["connections"][0]["http2"]["remote_settings"],
+            {"initial_window_size": 1048576},
+        )
+        reused.start_attempt(2, {})
+        fresh = InstrumentedStream(FakeH2Stream(self.clock), self.registry)
+        reused.response(httpx.Response(200, extensions={"network_stream": fresh}))
+        self.assertEqual(reused.snapshot()["http2_settings"], {})
+
+    async def test_wire_settings_are_inherited_without_a_trace_on_reused_stream(self):
+        wire = h2_frame(4, b"\x00\x04" + (1048576).to_bytes(4, "big"))
+        stream = InstrumentedStream(FakeH2Stream(self.clock, [wire]), self.registry)
+        await stream.read(4096)
+        self.record.response(httpx.Response(200, extensions={"network_stream": stream}))
+        self.assertEqual(self.record.snapshot()["http2_settings"], {"initial_window_size": 1048576})
+
+    async def test_settings_trace_does_not_overwrite_newer_connection_settings(self):
+        from h2.events import RemoteSettingsChanged
+        from h2.settings import ChangedSetting, SettingCodes
+
+        first = h2_frame(
+            4, b"\x00\x03" + (100).to_bytes(4, "big") + b"\x00\x04" + (65535).to_bytes(4, "big")
+        )
+        update = h2_frame(4, b"\x00\x04" + (1048576).to_bytes(4, "big"))
+        stream = InstrumentedStream(FakeH2Stream(self.clock, [first, update]), self.registry)
+        await stream.read(4096)
+        self.record.response(httpx.Response(200, extensions={"network_stream": stream}))
+        await stream.read(4096)
+        settings = RemoteSettingsChanged()
+        settings.changed_settings[SettingCodes.MAX_CONCURRENT_STREAMS] = ChangedSetting(
+            SettingCodes.MAX_CONCURRENT_STREAMS, 100, 200
+        )
+        await self.record.trace(
+            "http2.receive_remote_settings.complete", {"return_value": settings}
+        )
+        self.assertEqual(
+            self.record.snapshot()["http2_settings"],
+            {"max_concurrent_streams": 200, "initial_window_size": 1048576},
+        )
+
+    async def test_http1_and_unknown_alpn_ignore_h2_shaped_bytes(self):
+        for alpn in ("http/1.1", None):
+            wire = h2_frame(3, (1).to_bytes(4, "big"), stream_id=1)
+            inner = FakeH2Stream(self.clock, [wire], alpn=alpn)
+            stream = InstrumentedStream(inner, self.registry)
+            self.assertEqual(await stream.read(4096), wire)
+            await stream.write(wire)
+            h2 = stream.state.snapshot()["http2"]
+            self.assertEqual(h2["frame_counts"], {"inbound": {}, "outbound": {}})
+            self.assertEqual(h2["recent_frames"], [])
+
+    async def test_h2_observation_preserves_transport_failure_and_cancellation(self):
+        inner = FakeH2Stream(self.clock)
+        stream = InstrumentedStream(inner, self.registry)
+        failure = httpcore.ReadError("PRIVATE socket error")
+        inner.failure = failure
+        with self.assertRaises(httpcore.ReadError) as caught:
+            await stream.read(4096, 2)
+        self.assertIs(caught.exception, failure)
+        cancelled = asyncio.CancelledError("PRIVATE cancellation")
+        inner.failure = cancelled
+        with self.assertRaises(asyncio.CancelledError) as caught:
+            await stream.read(4096, 3)
+        self.assertIs(caught.exception, cancelled)
+
+        async def cancelled_write(buffer, timeout=None):
+            raise cancelled
+
+        inner.write = cancelled_write
+        with self.assertRaises(asyncio.CancelledError) as caught:
+            await stream.write(b"PRIVATE", 4)
+        self.assertIs(caught.exception, cancelled)
+        self.assertNotIn("PRIVATE", json.dumps(stream.state.snapshot()))
 
 
 if __name__ == "__main__":

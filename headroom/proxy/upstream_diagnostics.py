@@ -1,7 +1,8 @@
 """Bounded, payload-free evidence for streaming stalls and transport failures.
 
 The httpcore trace extension describes request phases; a network-stream delegate
-measures socket I/O without inspecting bytes. Neither hook changes timeouts,
+measures socket I/O and observes HTTP/2 frame headers and numeric control fields.
+It skips body/header payloads and GOAWAY debug text. Neither hook changes timeouts,
 protocol selection, retries, cancellation, or the bytes passing through it.
 """
 
@@ -48,6 +49,29 @@ _PHASES = frozenset(
     }
 )
 _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,160}\Z")
+_H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+_H2_SETTINGS = {
+    1: "header_table_size",
+    2: "enable_push",
+    3: "max_concurrent_streams",
+    4: "initial_window_size",
+    5: "max_frame_size",
+    6: "max_header_list_size",
+    8: "enable_connect_protocol",
+    9: "no_rfc7540_priorities",
+}
+_H2_FRAME_NAMES = (
+    "DATA",
+    "HEADERS",
+    "PRIORITY",
+    "RST_STREAM",
+    "SETTINGS",
+    "PUSH_PROMISE",
+    "PING",
+    "GOAWAY",
+    "WINDOW_UPDATE",
+    "CONTINUATION",
+)
 
 
 def _identifier(value: Any) -> str | None:
@@ -237,6 +261,7 @@ class StreamRecord:
         self.stream_id = None
         self.connection_id = None
         self.upstream_ids = {}
+        self.http2_settings = {}
         self.timeouts = {
             key: value
             for key, value in timeouts.items()
@@ -287,17 +312,15 @@ class StreamRecord:
             if phase == "receive_remote_settings" and outcome == "complete":
                 settings = getattr(info.get("return_value"), "changed_settings", {})
                 if isinstance(settings, dict):
-                    names = {
-                        1: "header_table_size",
-                        3: "max_concurrent_streams",
-                        4: "initial_window_size",
-                        5: "max_frame_size",
-                        6: "max_header_list_size",
-                    }
+                    values = {}
                     for key, setting in settings.items():
                         value = getattr(setting, "new_value", None)
-                        if key in names and type(value) is int and 0 <= value <= 2**32 - 1:
-                            self.http2_settings[names[key]] = value
+                        if key in _H2_SETTINGS and type(value) is int and 0 <= value <= 2**32 - 1:
+                            values[_H2_SETTINGS[key]] = value
+                    self.http2_settings.update(values)
+                    connection = self.owner.connections.get(self.connection_id)
+                    if connection is not None:
+                        connection.http2_settings.update(values)
                     event["remote_settings"] = dict(self.http2_settings)
         self.events.append(event)
 
@@ -309,6 +332,9 @@ class StreamRecord:
         except Exception:
             value = None
         self.connection_id = _identifier(value) or f"{os.getpid()}-network-{id(stream):x}"
+        connection = self.owner.connections.get(self.connection_id)
+        if connection is not None:
+            self.http2_settings.update(connection.http2_settings)
         if self.attempts:
             self.attempts[-1]["connection_id"] = self.connection_id
 
@@ -366,6 +392,9 @@ class StreamRecord:
         now = self.ended if self.ended is not None else self.owner.clock()
         for name, wait in self.waits.items():
             self._slow(name, wait)
+        connection = self.owner.connections.get(self.connection_id)
+        if connection is not None:
+            self.http2_settings.update(connection.http2_settings)
         return {
             "record_id": self.key,
             "pid": os.getpid(),
@@ -404,6 +433,31 @@ class ConnectionRecord:
         self.timeouts: dict = {}
         self.last_read_at: float | None = None
         self.last_write_at: float | None = None
+        self.http2_settings: dict = {}
+        self.http2_local_settings: dict = {}
+        self.http2_observers: dict = {}
+        self.http2_events: deque = deque(maxlen=32)
+        self.http2_frame_counts = {"inbound": {}, "outbound": {}}
+        self.http2_data_bytes = {"inbound": 0, "outbound": 0}
+        self.http2_window_increments = {
+            "inbound": {"connection": 0, "streams": 0},
+            "outbound": {"connection": 0, "streams": 0},
+        }
+        self.http2_metadata_omitted = 0
+        self.http2_observer_errors = 0
+
+    def observe_http2(self, direction: str, data: bytes) -> None:
+        observer = self.http2_observers.get(direction)
+        if observer is None:
+            observer = self.http2_observers[direction] = H2FrameObserver(self, direction)
+        try:
+            observer.feed(data)
+        except Exception:
+            # Observation must never interfere with the underlying transport.
+            observer.disabled = True
+            observer.header.clear()
+            observer.payload.clear()
+            self.http2_observer_errors += 1
 
     def start(self, name: str, timeout=None) -> None:
         self.waits.setdefault(name, Wait()).started = self.owner.clock()
@@ -445,7 +499,144 @@ class ConnectionRecord:
             "read_bytes": waits.get("socket_read", {}).get("bytes", 0),
             "write_bytes": waits.get("socket_write", {}).get("bytes", 0),
             "waits": waits,
+            "http2": {
+                "remote_settings": dict(self.http2_settings),
+                "local_settings": dict(self.http2_local_settings),
+                "frame_counts": {
+                    key: dict(value) for key, value in self.http2_frame_counts.items()
+                },
+                "data_payload_bytes": dict(self.http2_data_bytes),
+                "window_update_increments": {
+                    key: dict(value) for key, value in self.http2_window_increments.items()
+                },
+                "recent_frames": list(self.http2_events),
+                "metadata_omitted_frames": self.http2_metadata_omitted,
+                "observer_errors": self.http2_observer_errors,
+                "buffered_bytes": sum(
+                    len(item.header) + len(item.payload) for item in self.http2_observers.values()
+                ),
+                "pending_frames": [
+                    {**item.frame, "remaining_payload_bytes": item.remaining}
+                    for item in self.http2_observers.values()
+                    if item.frame is not None
+                ],
+            },
         }
+
+
+class H2FrameObserver:
+    """Read framing metadata only; payloads are skipped without retaining bytes."""
+
+    def __init__(self, state: ConnectionRecord, direction: str):
+        self.state, self.direction = state, direction
+        self.preface_position = 0 if direction == "outbound" else len(_H2_PREFACE)
+        self.header = bytearray()
+        self.payload = bytearray()
+        self.frame: dict | None = None
+        self.remaining = 0
+        self.capture = 0
+        self.disabled = False
+
+    def feed(self, data: bytes) -> None:
+        if self.disabled:
+            return
+        view = memoryview(data)
+        offset = 0
+        while offset < len(view):
+            if self.preface_position < len(_H2_PREFACE):
+                size = min(len(view) - offset, len(_H2_PREFACE) - self.preface_position)
+                if (
+                    view[offset : offset + size]
+                    != _H2_PREFACE[self.preface_position : self.preface_position + size]
+                ):
+                    self.disabled = True
+                    self.state.http2_observer_errors += 1
+                    return
+                self.preface_position += size
+                offset += size
+                continue
+            if self.frame is None:
+                size = min(9 - len(self.header), len(view) - offset)
+                self.header.extend(view[offset : offset + size])
+                offset += size
+                if len(self.header) < 9:
+                    continue
+                length = int.from_bytes(self.header[:3], "big")
+                kind, flags = self.header[3:5]
+                self.frame = {
+                    "direction": self.direction,
+                    "at_ms": round((self.state.owner.clock() - self.state.started) * 1000),
+                    "type": kind,
+                    "flags": flags,
+                    "stream_id": int.from_bytes(self.header[5:9], "big") & 0x7FFFFFFF,
+                    "length": length,
+                }
+                self.header.clear()
+                self.remaining = length
+                self.capture = 0
+                if kind in {3, 8} and length == 4:
+                    self.capture = 4
+                elif kind == 7 and length >= 8:
+                    self.capture = 8
+                elif kind == 4 and not flags & 1 and length % 6 == 0:
+                    # ponytail: skip SETTINGS over 256 bytes; incremental tuple parsing if a peer needs more.
+                    if length <= 256:
+                        self.capture = length
+                    else:
+                        self.frame["metadata_omitted"] = True
+                        self.state.http2_metadata_omitted += 1
+                if not self.remaining:
+                    self._finish()
+                    continue
+            size = min(self.remaining, len(view) - offset)
+            capture_size = min(size, self.capture - len(self.payload))
+            if capture_size:
+                self.payload.extend(view[offset : offset + capture_size])
+            offset += size
+            self.remaining -= size
+            if not self.remaining:
+                self._finish()
+
+    def _finish(self) -> None:
+        event = self.frame
+        assert event is not None
+        kind = event["type"]
+        name = _H2_FRAME_NAMES[kind] if kind < len(_H2_FRAME_NAMES) else "UNKNOWN"
+        counts = self.state.http2_frame_counts[self.direction]
+        counts[name] = counts.get(name, 0) + 1
+        if kind == 0:
+            self.state.http2_data_bytes[self.direction] += event["length"]
+        elif kind == 3 and len(self.payload) == 4:
+            event["error_code"] = int.from_bytes(self.payload, "big")
+        elif kind == 7 and len(self.payload) == 8:
+            event["last_stream_id"] = int.from_bytes(self.payload[:4], "big") & 0x7FFFFFFF
+            event["error_code"] = int.from_bytes(self.payload[4:], "big")
+            event["debug_data_length"] = event["length"] - 8
+        elif kind == 8 and len(self.payload) == 4:
+            increment = int.from_bytes(self.payload, "big") & 0x7FFFFFFF
+            event["increment"] = increment
+            key = "streams" if event["stream_id"] else "connection"
+            self.state.http2_window_increments[self.direction][key] += increment
+        elif kind == 4 and self.payload:
+            values = {}
+            for offset in range(0, len(self.payload), 6):
+                key = int.from_bytes(self.payload[offset : offset + 2], "big")
+                if key in _H2_SETTINGS:
+                    values[_H2_SETTINGS[key]] = int.from_bytes(
+                        self.payload[offset + 2 : offset + 6], "big"
+                    )
+            settings = (
+                self.state.http2_settings
+                if self.direction == "inbound"
+                else self.state.http2_local_settings
+            )
+            settings.update(values)
+            event["settings"] = values
+        self.state.http2_events.append(event)
+        if kind in {3, 7}:
+            _emit("h2_control", {"connection_id": self.state.key, **event})
+        self.payload.clear()
+        self.frame = None
 
 
 class StreamDiagnostics:
@@ -524,7 +715,7 @@ diagnostics = StreamDiagnostics()
 
 
 class InstrumentedStream(httpcore.AsyncNetworkStream):
-    """Transparent stream delegate: inspect lengths and timings, never bytes."""
+    """Transparent delegate: retain lengths, timings and numeric HTTP/2 metadata."""
 
     def __init__(self, inner, owner=diagnostics, state=None):
         self.inner = inner
@@ -548,6 +739,7 @@ class InstrumentedStream(httpcore.AsyncNetworkStream):
                     self.state.addresses["tls_version"] = version
         except Exception:
             pass
+        self.http2 = self.state.addresses.get("alpn") == "h2"
 
     async def read(self, max_bytes, timeout=None):
         self.state.start("socket_read", timeout)
@@ -557,6 +749,8 @@ class InstrumentedStream(httpcore.AsyncNetworkStream):
             self.state.end("socket_read", error=error)
             raise
         self.state.end("socket_read", size=len(data))
+        if self.http2:
+            self.state.observe_http2("inbound", data)
         return data
 
     async def write(self, buffer, timeout=None):
@@ -567,6 +761,8 @@ class InstrumentedStream(httpcore.AsyncNetworkStream):
             self.state.end("socket_write", error=error)
             raise
         self.state.end("socket_write", size=len(buffer))
+        if self.http2:
+            self.state.observe_http2("outbound", buffer)
         return result
 
     async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
