@@ -16,6 +16,8 @@ from h2.config import H2Configuration
 from h2.connection import H2Connection
 from h2.events import StreamEnded
 
+from headroom.proxy.upstream_diagnostics import StreamDiagnostics
+
 try:
     from headroom.proxy import diagnostic_probe as probe
 except ImportError:
@@ -524,6 +526,12 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             all(request.headers["Authorization"] == "proxy credential" for request in requests[4:])
         )
         self.assertEqual(len({request.headers["x-client-request-id"] for request in requests}), 8)
+        self.assertEqual([row["sequence"] for row in result["results"]], list(range(1, 9)))
+        owner = StreamDiagnostics()
+        for row, request in zip(result["results"], requests, strict=True):
+            record = owner.begin("codex")
+            record.bind_client_headers(request.headers.raw)
+            self.assertEqual(record.client_request_id, row["request_id"])
         self.assertNotIn("credential", json.dumps(result))
 
 

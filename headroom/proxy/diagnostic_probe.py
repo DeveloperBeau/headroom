@@ -352,7 +352,8 @@ async def compare(options: dict) -> dict:
                         return result
                     started = time.monotonic()
                     row = {
-                        "request_id": f"{run_id}-{len(result['results']) + 1}",
+                        "request_id": str(uuid4()),
+                        "sequence": len(result["results"]) + 1,
                         "started_at": datetime.now(timezone.utc).isoformat(),
                         "route": route,
                         "requested_protocol": protocol,

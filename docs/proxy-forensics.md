@@ -93,8 +93,9 @@ bodies, or exception messages in the output. Input errors emit only
 An initial transport failure remains `error_type` if response cleanup also fails;
 the later cleanup failure appears separately as `response_cleanup_error_type`.
 
-Every request carries a generated `x-client-request-id`, also emitted as
-`request_id`, so diagnostics can correlate it. Any supplied value for that
+Every request carries a canonical UUID in `x-client-request-id`, also emitted as
+`request_id`, so diagnostics can correlate it. `run_id` identifies the comparison;
+each row's `sequence` records its order within the run. Any supplied value for that
 header is replaced. The allowlisted provider response identifiers (`request-id`,
 `x-request-id`, `anthropic-request-id`, `cf-ray`) are accepted only as short
 ASCII identifiers and emitted as 24-character SHA-256 prefixes, never raw values.
