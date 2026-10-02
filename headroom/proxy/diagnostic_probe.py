@@ -204,7 +204,7 @@ class _SSE:
                 self.data.extend(value + b"\n")
 
 
-def _error_type(error: Exception) -> str:
+def _error_type(error: BaseException) -> str:
     for cls in (
         httpx.ConnectTimeout,
         httpx.ReadTimeout,
@@ -216,6 +216,8 @@ def _error_type(error: Exception) -> str:
         httpx.RemoteProtocolError,
         httpx.LocalProtocolError,
         httpx.DecodingError,
+        asyncio.TimeoutError,
+        asyncio.CancelledError,
     ):
         if isinstance(error, cls):
             return cls.__name__
@@ -227,9 +229,12 @@ async def _request(client, options, url, headers, row, connections) -> None:
     request_headers = httpx.Headers(headers)
     request_headers["x-client-request-id"] = row["request_id"]
     request_headers["accept-encoding"] = "identity"
-    async with client.stream(
+    request = client.build_request(
         options["method"], url, content=options["body"], headers=request_headers
-    ) as response:
+    )
+    response = await client.send(request, stream=True)
+    failed = False
+    try:
         row["headers_ms"] = round((time.monotonic() - started) * 1000)
         row["status"] = response.status_code
         version = response.extensions.get("http_version")
@@ -298,6 +303,16 @@ async def _request(client, options, url, headers, row, connections) -> None:
             if can_parse and not parser.terminal
             else "complete"
         )
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            await asyncio.wait_for(response.aclose(), timeout=1)
+        except BaseException as error:
+            row["response_cleanup_error_type"] = _error_type(error)
+            if not failed:
+                raise
 
 
 async def compare(options: dict) -> dict:

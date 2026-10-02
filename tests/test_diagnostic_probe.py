@@ -244,6 +244,26 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row["error_type"] for row in result["results"]}, {"ConnectError"})
         self.assertNotIn("secret", json.dumps(result))
 
+    async def test_read_failure_survives_response_cleanup_failure_and_redacts_both(self):
+        class BrokenBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                raise httpx.ReadError("secret read credential and private upstream URL")
+                yield b""  # Keep the failing iterator an async generator.
+
+            async def aclose(self):
+                raise httpx.WriteError("secret close credential and private upstream URL")
+
+        result = await self.fake_comparison(
+            lambda request: httpx.Response(200, stream=BrokenBody())
+        )
+        self.assertEqual(len(result["results"]), 4)
+        for row in result["results"]:
+            self.assertEqual(row["outcome"], "transport_error")
+            self.assertEqual(row["error_type"], "ReadError")
+            self.assertEqual(row["response_cleanup_error_type"], "WriteError")
+        for secret in ("secret", "credential", "private", "upstream URL"):
+            self.assertNotIn(secret, json.dumps(result))
+
     async def test_h2_wire_negotiation_and_stream_reuse_with_fake_tls(self):
         streams = []
 

@@ -53,14 +53,17 @@ that fallback, rather than claiming an HTTP/2 comparison succeeded.
 - `--timeout` is 1..60 seconds per entire request, default 30, as well as the
   HTTP client's operation timeout. `--max-seconds` is a 1..300 second run budget,
   default 120. At exhaustion, stop the remaining matrix and report incomplete.
-  Client cleanup has its own one-second cap; this can extend the run budget.
+  Response and client cleanup each have a one-second cap; cleanup can extend the
+  run budget.
 - `--max-response-bytes` is 1..33554432, default 1048576. Oversized responses are
   closed and marked `response_limit`. Request files are limited to 1 MiB, headers
   to 16 KiB/64 fields, and endpoint files to 8 KiB. SSE lines/events retain at
   most 64 KiB each, marking `sse_parser_limited` when exceeded.
 - TLS certificate and hostname verification are always enabled. `--ca-file`
   supplies a PEM CA bundle if your endpoint uses a private CA; it never disables
-  verification. Environment proxies and environment CA overrides are ignored.
+  verification. Environment proxies are ignored. Without `--ca-file`, the
+  stdlib default trust store honors `SSL_CERT_FILE` and `SSL_CERT_DIR`; an explicit
+  `--ca-file` selects that CA bundle instead.
 - URLs must use HTTPS and cannot contain credentials or fragments. Query strings
   may be supplied but are never emitted. Redirects are never followed, including
   redirects to a different host or plaintext endpoint.
@@ -87,6 +90,8 @@ response byte count, stream ID where available, and categorical errors. There
 are no supplied URLs, paths, query strings, header values, request/response
 bodies, or exception messages in the output. Input errors emit only
 `{"error": "invalid_input"}`; unknown runtime errors emit `probe_unavailable`.
+An initial transport failure remains `error_type` if response cleanup also fails;
+the later cleanup failure appears separately as `response_cleanup_error_type`.
 
 Every request carries a generated `x-client-request-id`, also emitted as
 `request_id`, so diagnostics can correlate it. Any supplied value for that
