@@ -216,6 +216,7 @@ class RouteHealthMiddleware:
         max_gap_ms = 0
         event_tail = b""
         raised: BaseException | None = None
+        downstream_error: BaseException | None = None
         client_disconnected = False
 
         async def observe_receive() -> dict:
@@ -228,6 +229,7 @@ class RouteHealthMiddleware:
 
         async def observe_send(message: dict) -> None:
             nonlocal status, is_sse, complete, terminal, error_event
+            nonlocal downstream_error
             nonlocal chunks, byte_count, first_byte_at, last_byte_at, max_gap_ms, event_tail
             if message["type"] == "http.response.start":
                 status = message["status"]
@@ -259,6 +261,7 @@ class RouteHealthMiddleware:
             try:
                 await send(message)
             except BaseException as exc:
+                downstream_error = exc
                 diagnostic.wait_end("downstream_send", exception=exc)
                 raise
             else:
@@ -304,7 +307,9 @@ class RouteHealthMiddleware:
             quiet_ms = idle_ms if idle_ms is not None else round((ended - started) * 1000)
             if reason != "interrupted" or quiet_ms >= 60_000:
                 self.health.record(route, success, reason, stream)
-            diagnostics.end(diagnostic, reason, exception=raised)
+            diagnostics.end(
+                diagnostic, reason, exception=raised if raised is not downstream_error else None
+            )
             log = logger.info if success else logger.warning
             log(
                 "event=route_stream_outcome route=%s reason=%s status=%s "

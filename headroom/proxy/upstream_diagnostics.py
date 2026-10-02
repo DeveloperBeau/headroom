@@ -991,6 +991,9 @@ class StreamDiagnostics:
             if record is not None:
                 record.first_fault_id = record.first_fault_id or fault_id
             ref = self.pools.get(record.pool_id) if record is not None else None
+            pool = ref() if ref else None
+            if pool is None and connection is not None and connection.pool is not None:
+                pool = connection.pool()
             snapshots = {}
             for key, value in (("request", record), ("connection", connection)):
                 try:
@@ -1010,7 +1013,7 @@ class StreamDiagnostics:
                 "attempt": record.attempt if record else None,
                 "stream_id": record.stream_id if record else None,
                 **snapshots,
-                "pool": pool_snapshot(ref()) if ref else None,
+                "pool": pool_snapshot(pool) if pool is not None else None,
             }
             if item["pool"] is not None:
                 item["pool"]["connections"] = item["pool"].get("connections", [])[:8]

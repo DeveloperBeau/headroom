@@ -5,6 +5,7 @@ import json
 import ssl
 import struct
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -42,6 +43,65 @@ class ForensicsTests(unittest.IsolatedAsyncioTestCase):
         self.record.start_attempt(1, {"read": 2})
         self.inner = Socket()
         self.stream = module.InstrumentedStream(self.inner, self.owner)
+
+    async def test_middleware_downstream_failure_does_not_consume_upstream_fault(self):
+        from headroom.proxy import route_health
+
+        failure = BrokenPipeError(32, "PRIVATE downstream")
+
+        async def app(scope, receive, send):
+            record = module.current_stream.get()
+            record.start_attempt(1, {})
+            self.stream.state.bind(record)
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+
+        async def receive():
+            return {"type": "http.request", "body": b""}
+
+        async def send(message):
+            raise failure
+
+        middleware = route_health.RouteHealthMiddleware(app, route_health.RouteHealth())
+        with patch.object(route_health, "diagnostics", self.owner):
+            with self.assertRaises(BrokenPipeError) as caught:
+                await middleware(
+                    {"type": "http", "path": "/v1/responses", "method": "POST"}, receive, send
+                )
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(self.owner.snapshot()["first_faults"], [])
+        self.assertIsNone(self.stream.state.first_fault_id)
+        self.assertEqual(self.owner.snapshot()["recent"][-1]["error"][0]["type"], "BrokenPipeError")
+        self.inner.error = httpcore.ReadError("PRIVATE upstream")
+        with self.assertRaises(httpcore.ReadError):
+            await self.stream.read(1)
+        fault = self.owner.snapshot()["first_faults"][0]
+        self.assertEqual(fault["phase"], "socket_read")
+        self.assertEqual(fault["error"][0]["type"], "ReadError")
+
+    async def test_goaway_retains_connection_pool_without_inventing_request(self):
+        pool = httpcore.AsyncConnectionPool(max_connections=7, max_keepalive_connections=3)
+        self.owner.register_pool(pool)
+        self.stream.state.pool = weakref.ref(pool)
+        self.record.stream_id = 1
+        self.stream.state.bind(self.record)
+        wire = b"\x00\x00\x08\x07\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01"
+        try:
+            self.stream.state.observe_http2("inbound", wire)
+            fault = self.owner.snapshot()["first_faults"][0]
+            self.assertIsNone(fault["request"])
+            self.assertIsNone(fault["record_id"])
+            self.assertIsNone(fault["request_id"])
+            self.assertIsNone(fault["stream_id"])
+            self.assertIsNotNone(fault["pool"])
+            self.assertEqual(fault["pool"]["availability"], "available")
+            self.assertEqual(fault["pool"]["max_connections"], 7)
+            frame = fault["connection"]["http2"]["recent_frames"][-1]
+            self.assertEqual(
+                (frame["stream_id"], frame["last_stream_id"], frame["error_code"]), (0, 1, 1)
+            )
+            self.assertEqual(fault["connection"]["close_evidence"]["fin_rst_direction"], "unknown")
+        finally:
+            await pool.aclose()
 
     async def test_first_fault_is_frozen_before_cleanup_retry_and_eviction(self):
         token = module.current_stream.set(self.record)
