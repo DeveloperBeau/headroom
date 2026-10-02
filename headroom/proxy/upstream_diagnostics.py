@@ -9,20 +9,28 @@ protocol selection, retries, cancellation, or the bytes passing through it.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import socket
+import ssl
+import struct
+import sys
 import time
+import weakref
 from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from ipaddress import ip_address
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpcore
+import httpx
 
 logger = logging.getLogger("headroom.proxy")
 current_stream: ContextVar[StreamRecord | None] = ContextVar("current_stream", default=None)
@@ -82,6 +90,128 @@ def _number(value: Any) -> int | float | None:
     if type(value) in (int, float) and 0 <= value <= 10**12 and math.isfinite(value):
         return value
     return None
+
+
+def _utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _transport_error(error: BaseException) -> bool:
+    return isinstance(
+        error,
+        (
+            httpcore.NetworkError,
+            httpcore.ProtocolError,
+            httpcore.TimeoutException,
+            httpx.TransportError,
+            OSError,
+        ),
+    ) and not isinstance(error, (ssl.SSLWantReadError, ssl.SSLWantWriteError))
+
+
+def _stack(error: BaseException | None) -> list[dict]:
+    result = []
+    tb = error.__traceback__ if error is not None else None
+    while tb is not None and len(result) < 8:
+        name = tb.tb_frame.f_code.co_name
+        result.append(
+            {
+                "function": name
+                if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,63}", name)
+                else "unknown",
+                "line": tb.tb_lineno,
+            }
+        )
+        tb = tb.tb_next
+    return result
+
+
+def _origin_key(origin) -> str | None:
+    try:
+        # Origins may contain operator or caller supplied hosts. Keep only a digest.
+        host, scheme, port = origin.host, origin.scheme, origin.port
+        if type(host) is bytes and len(host) <= 253 and type(scheme) is bytes and type(port) is int:
+            return hashlib.sha256(scheme + b":" + host + str(port).encode()).hexdigest()[:24]
+    except Exception:
+        pass
+    return None
+
+
+def pool_snapshot(pool) -> dict:
+    """Best-effort httpcore metadata; never retain requests, headers or origin text."""
+    result: dict = {"availability": "unavailable"}
+    try:
+        connections, requests = pool._connections, pool._requests
+        if not isinstance(connections, list) or not isinstance(requests, list):
+            return result
+        result.update(
+            availability="available",
+            max_connections=_number(pool._max_connections),
+            max_keepalive_connections=_number(pool._max_keepalive_connections),
+            keepalive_expiry_seconds=_number(pool._keepalive_expiry),
+            queued_requests=sum(item.connection is None for item in requests),
+            assigned_requests=sum(item.connection is not None for item in requests),
+            total_connections=len(connections),
+            connections=[],
+            origins=[],
+            omitted_connections=max(0, len(connections) - _LIMIT),
+        )
+        origins: dict = {}
+        for connection in connections[:_LIMIT]:
+            origin = _origin_key(getattr(connection, "_origin", None))
+            inner = getattr(connection, "_connection", None)
+            stream = getattr(inner, "_network_stream", None)
+            state = stream.state if isinstance(stream, InstrumentedStream) else None
+            events = getattr(inner, "_events", None)
+            assigned = sum(item.connection is connection for item in requests)
+            item = {
+                "origin_id": origin,
+                "connection_id": state.key if state else None,
+                "idle": bool(connection.is_idle()),
+                "closed": bool(connection.is_closed()),
+                "expired": bool(connection.has_expired()),
+                "assigned_requests": assigned,
+                "active_streams": len(events)
+                if isinstance(events, dict)
+                else min(assigned, 1)
+                if isinstance(inner, httpcore.AsyncHTTP11Connection)
+                else None,
+                "stream_limit": _number(getattr(inner, "_max_streams", None)),
+                "age_ms": round((state.owner.clock() - state.started) * 1000) if state else None,
+                "reuse_count": state.reuse_count if state else None,
+            }
+            result["connections"].append(item)
+            group = origins.setdefault(
+                origin,
+                {
+                    "origin_id": origin,
+                    "active_connections": 0,
+                    "idle_connections": 0,
+                    "active_streams": 0,
+                    "active_streams_available": True,
+                    "queued_requests": 0,
+                },
+            )
+            group["idle_connections" if item["idle"] else "active_connections"] += 1
+            group["active_streams"] += item["active_streams"] or 0
+            group["active_streams_available"] &= item["active_streams"] is not None
+        for request in requests:
+            origin = _origin_key(request.request.url.origin)
+            if origin not in origins and len(origins) < _LIMIT:
+                origins[origin] = {
+                    "origin_id": origin,
+                    "active_connections": 0,
+                    "idle_connections": 0,
+                    "active_streams": 0,
+                    "active_streams_available": True,
+                    "queued_requests": 0,
+                }
+            if origin in origins and request.connection is None:
+                origins[origin]["queued_requests"] += 1
+        result["origins"] = list(origins.values())
+    except Exception:
+        result["availability"] = "unavailable"
+    return result
 
 
 def exception_details(error: BaseException | None) -> list[dict]:
@@ -176,9 +306,15 @@ class StreamRecord:
     ):
         self.owner, self.key, self.route = owner, key, route
         self.started = owner.clock()
+        self.timestamp = _utc()
         self.ended: float | None = None
         self.request_id: str | None = None
         self.client_request_id: str | None = None
+        self.session_ids: dict = {}
+        self.cancellations: deque = deque(maxlen=8)
+        self.first_fault_id: str | None = None
+        self.pool_id: str | None = None
+        self.last_connection_binding: tuple | None = None
         self.client_port = client_port if type(client_port) is int else None
         self.client_http_version = (
             http_version if http_version in {"1.0", "1.1", "2", "3"} else None
@@ -209,6 +345,25 @@ class StreamRecord:
             except ValueError:
                 pass
 
+    def bind_client_headers(self, headers) -> None:
+        try:
+            for name, value in headers:
+                name = name.lower()
+                if name == b"x-client-request-id" and len(value) <= 64:
+                    self.bind_client_request_id(value.decode("ascii", errors="replace"))
+                elif name in {
+                    b"session_id",
+                    b"conversation_id",
+                    b"x-session-id",
+                    b"x-claude-code-session-id",
+                }:
+                    if len(value) <= 160 and _identifier(value.decode("ascii", errors="replace")):
+                        self.session_ids[name.decode("ascii")] = hashlib.sha256(value).hexdigest()[
+                            :24
+                        ]
+        except Exception:
+            pass
+
     def wait_start(self, name: str) -> None:
         if name in _PHASES:
             self.waits.setdefault(name, Wait()).started = self.owner.clock()
@@ -219,7 +374,7 @@ class StreamRecord:
             wait.end(self.owner.clock(), size if type(size) is int and size >= 0 else 0)
             self._slow(name, wait)
         if exception is not None:
-            self.observe_exception(exception)
+            self.observe_exception(exception, phase=name)
 
     def _slow(self, name: str, wait: Wait) -> None:
         now = self.owner.clock()
@@ -240,8 +395,41 @@ class StreamRecord:
 
     def mark_disconnected(self) -> None:
         self.disconnected = True
+        self.cancellation("downstream_disconnect")
 
-    def observe_exception(self, exception: BaseException) -> None:
+    def cancellation(
+        self, origin: str, error: BaseException | None = None, phase="unknown"
+    ) -> None:
+        self.cancellations.append(
+            {
+                "at_ms": self._elapsed(),
+                "timestamp": _utc(),
+                "origin": origin
+                if origin
+                in {
+                    "downstream_disconnect",
+                    "shutdown",
+                    "operation_timeout",
+                    "deadline_timeout",
+                    "unknown",
+                }
+                else "unknown",
+                "phase": phase if phase in _PHASES else "unknown",
+                "task_cancelled": isinstance(error, asyncio.CancelledError),
+                "stack": _stack(error),
+            }
+        )
+
+    def observe_exception(self, exception: BaseException, phase="unknown") -> None:
+        if isinstance(exception, (asyncio.CancelledError, GeneratorExit)):
+            # Task.cancel() exposes no initiator. Context exceptions are not proof.
+            self.cancellation(
+                "downstream_disconnect" if self.disconnected else "unknown", exception, phase
+            )
+        elif isinstance(
+            exception, (httpcore.TimeoutException, httpx.TimeoutException, TimeoutError)
+        ):
+            self.cancellation("operation_timeout", exception, phase)
         details = exception_details(exception)
         if not self.errors or self.errors[-1]["error"] != details:
             self.errors.append(
@@ -254,6 +442,10 @@ class StreamRecord:
         self.error = details
         if self.attempts:
             self.attempts[-1]["error"] = self.error
+        if _transport_error(exception) and phase not in {"downstream_send", "downstream_yield"}:
+            self.owner.freeze_fault(
+                self.owner.connections.get(self.connection_id), self, phase, exception
+            )
 
     def start_attempt(self, attempt: int, timeouts: dict) -> None:
         self.attempt = attempt
@@ -285,6 +477,7 @@ class StreamRecord:
         _, phase, outcome = parts
         if phase not in _PHASES or outcome not in {"started", "complete", "failed"}:
             return
+        self.owner.bind_pool_request(self)
         stream_id = info.get("stream_id")
         if type(stream_id) is int:
             self.stream_id = stream_id
@@ -334,6 +527,7 @@ class StreamRecord:
         self.connection_id = _identifier(value) or f"{os.getpid()}-network-{id(stream):x}"
         connection = self.owner.connections.get(self.connection_id)
         if connection is not None:
+            connection.bind(self)
             self.http2_settings.update(connection.http2_settings)
         if self.attempts:
             self.attempts[-1]["connection_id"] = self.connection_id
@@ -398,9 +592,14 @@ class StreamRecord:
         return {
             "record_id": self.key,
             "pid": os.getpid(),
+            "timestamp": self.timestamp,
             "route": self.route,
             "request_id": self.request_id,
             "client_request_id": self.client_request_id,
+            "session_ids": dict(self.session_ids),
+            "cancellations": list(self.cancellations),
+            "first_fault_id": self.first_fault_id,
+            "pool_id": self.pool_id,
             "client_port": self.client_port,
             "client_http_version": self.client_http_version,
             "age_ms": round(max(0, now - self.started) * 1000),
@@ -426,6 +625,22 @@ class ConnectionRecord:
     def __init__(self, owner: StreamDiagnostics, key: str):
         self.owner, self.key = owner, key
         self.started = owner.clock()
+        self.timestamp = _utc()
+        self.lifecycle: deque = deque(maxlen=24)
+        self.first_error: list = []
+        self.first_fault_id: str | None = None
+        self.reuse_count = 0
+        self.last_binding: tuple | None = None
+        self.pool = None
+        self.pool_connection = None
+        self.pool_observed: set = set()
+        self.tls: dict = {"availability": "unavailable"}
+        self.tcp: dict = {"availability": "unavailable"}
+        self.close_evidence = {
+            "read_eof": False,
+            "fin_rst_direction": "unknown",
+            "tls_close_notify": "unknown",
+        }
         self.waits: dict[str, Wait] = {}
         self.closed = False
         self.error: list = []
@@ -445,6 +660,62 @@ class ConnectionRecord:
         }
         self.http2_metadata_omitted = 0
         self.http2_observer_errors = 0
+        self.event("created")
+
+    def event(self, event: str, error: BaseException | None = None) -> None:
+        item = {
+            "event": event,
+            "timestamp": _utc(),
+            "at_ms": round((self.owner.clock() - self.started) * 1000),
+        }
+        if error is not None:
+            item["error"] = exception_details(error)
+            item["stack"] = _stack(error)
+        self.lifecycle.append(item)
+
+    def bind(self, record: StreamRecord) -> None:
+        binding = (record.key, record.attempt)
+        if record.last_connection_binding != (self.key, record.attempt):
+            if self.last_binding is not None:
+                self.reuse_count += 1
+                self.event("reused")
+            self.last_binding = binding
+            record.last_connection_binding = (self.key, record.attempt)
+        record.connection_id = self.key
+        if record.attempts:
+            record.attempts[-1]["connection_id"] = self.key
+
+    def failure(self, phase: str, error: BaseException) -> None:
+        self.error = exception_details(error)
+        self.event(phase + "_failed", error)
+        record = current_stream.get()
+        if record is not None and record.owner is not self.owner:
+            record = None
+        if isinstance(error, (asyncio.CancelledError, GeneratorExit)):
+            if record is not None:
+                record.cancellation(
+                    "downstream_disconnect" if record.disconnected else "unknown", error, phase
+                )
+        if _transport_error(error):
+            if not self.first_error:
+                self.first_error = exception_details(error)
+            self.owner.freeze_fault(self, record, phase, error)
+
+    def observe_pool(self) -> None:
+        try:
+            pool = self.pool() if self.pool else None
+            connection = self.pool_connection() if self.pool_connection else None
+            if pool is None or connection is None:
+                return
+            for event, observed in (
+                ("pool_expired", connection.has_expired()),
+                ("pool_removed", connection not in pool._connections),
+            ):
+                if observed and event not in self.pool_observed:
+                    self.pool_observed.add(event)
+                    self.event(event)
+        except Exception:
+            pass
 
     def observe_http2(self, direction: str, data: bytes) -> None:
         observer = self.http2_observers.get(direction)
@@ -470,7 +741,7 @@ class ConnectionRecord:
         if size and name == "socket_write":
             self.last_write_at = self.owner.clock()
         if error is not None:
-            self.error = exception_details(error)
+            self.failure(name, error)
 
     def snapshot(self) -> dict:
         now = self.owner.clock()
@@ -485,6 +756,14 @@ class ConnectionRecord:
                 )
         return {
             "connection_id": self.key,
+            "timestamp": self.timestamp,
+            "lifecycle": list(self.lifecycle),
+            "first_error": list(self.first_error),
+            "first_fault_id": self.first_fault_id,
+            "reuse_count": self.reuse_count,
+            "tcp": dict(self.tcp),
+            "tls": dict(self.tls),
+            "close_evidence": dict(self.close_evidence),
             "age_ms": round((now - self.started) * 1000),
             "closed": self.closed,
             "error": self.error,
@@ -635,6 +914,19 @@ class H2FrameObserver:
         self.state.http2_events.append(event)
         if kind in {3, 7}:
             _emit("h2_control", {"connection_id": self.state.key, **event})
+            if self.direction == "inbound" and (kind == 3 or event.get("error_code", 0)):
+                record = next(
+                    (
+                        item
+                        for item in self.state.owner.active.values()
+                        if item.connection_id == self.state.key
+                        and item.stream_id == event["stream_id"]
+                    ),
+                    None,
+                )
+                self.state.owner.freeze_fault(
+                    self.state, record, "http2_control", kind="h2_control"
+                )
         self.payload.clear()
         self.frame = None
 
@@ -649,6 +941,107 @@ class StreamDiagnostics:
         self.connections: OrderedDict[str, ConnectionRecord] = OrderedDict()
         self.omitted_records = 0
         self.omitted_connections = 0
+        self.instance = uuid4().hex
+        self.first_faults: deque = deque(maxlen=16)
+        self.fault_sequence = 0
+        self.pools: OrderedDict = OrderedDict()
+
+    def register_pool(self, pool) -> None:
+        try:
+            self.pools[f"{self.instance}-p{id(pool):x}"] = weakref.ref(pool)
+            while len(self.pools) > 16:
+                self.pools.popitem(last=False)
+        except Exception:
+            pass
+
+    def bind_pool_request(self, record: StreamRecord) -> None:
+        try:
+            for key, ref in self.pools.items():
+                pool = ref()
+                for pending in getattr(pool, "_requests", ()):
+                    if pending.request.extensions.get("trace") == record.trace:
+                        record.pool_id = key
+                        inner = getattr(pending.connection, "_connection", None)
+                        stream = getattr(inner, "_network_stream", None)
+                        if isinstance(stream, InstrumentedStream):
+                            stream.state.pool = ref
+                            stream.state.pool_connection = weakref.ref(pending.connection)
+                            stream.state.bind(record)
+                        return
+        except Exception:
+            pass
+
+    def freeze_fault(
+        self, connection, record, phase, error=None, *, kind="transport_error"
+    ) -> None:
+        # Freeze independently of mutable lifecycle rings and retry records.
+        try:
+            if (
+                connection is not None
+                and connection.first_fault_id is not None
+                and (record is None or record.first_fault_id is not None)
+            ):
+                return
+            if connection is None and (record is None or record.first_fault_id is not None):
+                return
+            self.fault_sequence += 1
+            fault_id = f"{self.instance}-f{self.fault_sequence}"
+            if connection is not None:
+                connection.first_fault_id = connection.first_fault_id or fault_id
+            if record is not None:
+                record.first_fault_id = record.first_fault_id or fault_id
+            ref = self.pools.get(record.pool_id) if record is not None else None
+            snapshots = {}
+            for key, value in (("request", record), ("connection", connection)):
+                try:
+                    snapshots[key] = value.snapshot() if value is not None else None
+                except Exception:
+                    snapshots[key] = {"availability": "unavailable"}
+            item = {
+                "fault_id": fault_id,
+                "timestamp": _utc(),
+                "pid": os.getpid(),
+                "kind": kind,
+                "phase": phase,
+                "error": exception_details(error),
+                "connection_id": connection.key if connection else None,
+                "record_id": record.key if record else None,
+                "request_id": record.request_id if record else None,
+                "attempt": record.attempt if record else None,
+                "stream_id": record.stream_id if record else None,
+                **snapshots,
+                "pool": pool_snapshot(ref()) if ref else None,
+            }
+            if item["pool"] is not None:
+                item["pool"]["connections"] = item["pool"].get("connections", [])[:8]
+                item["pool"]["origins"] = item["pool"].get("origins", [])[:8]
+            # Enforce a byte ceiling as well as count ceilings for frozen evidence.
+            if len(json.dumps(item)) > 24 * 1024:
+                item["pool"] = {"availability": "omitted_size_limit"}
+                if item["request"]:
+                    item["request"]["events"] = []
+                    item["request"]["attempts"] = []
+                if item["connection"] and "lifecycle" in item["connection"]:
+                    item["connection"]["lifecycle"] = item["connection"]["lifecycle"][-4:]
+                    item["connection"]["http2"]["recent_frames"] = item["connection"]["http2"][
+                        "recent_frames"
+                    ][-4:]
+            frozen = json.loads(json.dumps(item))
+            if len(json.dumps(frozen)) > 24 * 1024:
+                for key in ("request", "connection", "pool"):
+                    frozen[key] = {"availability": "omitted_size_limit"}
+            self.first_faults.append(frozen)
+            _emit("first_fault", {"fault": frozen})
+        except Exception:
+            # Neither introspection nor a broken logger may replace the I/O error.
+            pass
+
+    def shutdown(self) -> None:
+        for record in self.active.values():
+            try:
+                record.cancellation("shutdown")
+            except Exception:
+                pass
 
     def begin(self, route, *, client_port=None, http_version=None) -> StreamRecord:
         self.sequence += 1
@@ -698,17 +1091,36 @@ class StreamDiagnostics:
             self.omitted_connections += 1
             if victim is None:
                 return  # Keep active evidence; never reject traffic at the diagnostic ceiling.
+            self.connections[victim].event("diagnostic_evicted")
             del self.connections[victim]
         self.connections[record.key] = record
 
     def snapshot(self) -> dict:
-        return {
+        result = {
+            "forensics_schema": 1,
             "active": [record.snapshot() for record in self.active.values()],
             "recent": list(self.recent),
             "connections": [record.snapshot() for record in self.connections.values()],
             "omitted_records": self.omitted_records,
             "omitted_connections": self.omitted_connections,
+            "first_faults": json.loads(json.dumps(list(self.first_faults))),
+            "pools": [
+                {"pool_id": key, **pool_snapshot(ref())}
+                for key, ref in self.pools.items()
+                if ref() is not None
+            ],
+            "omitted_snapshot_records": {},
         }
+        # Leave room for /debug/streams runtime fields inside its 2 MiB consumer cap.
+        size = len(json.dumps(result))
+        for name in ("recent", "pools", "connections", "active"):
+            omitted = 0
+            while result[name] and size > 1_900_000:
+                size -= len(json.dumps(result[name].pop(0))) + 2
+                omitted += 1
+            if omitted:
+                result["omitted_snapshot_records"][name] = omitted
+        return result
 
 
 diagnostics = StreamDiagnostics()
@@ -732,32 +1144,90 @@ class InstrumentedStream(httpcore.AsyncNetworkStream):
         try:
             ssl = inner.get_extra_info("ssl_object")
             if ssl is not None:
+                self.state.tls = {"availability": "available"}
                 alpn, version = ssl.selected_alpn_protocol(), ssl.version()
                 if alpn in {"h2", "http/1.1"}:
                     self.state.addresses["alpn"] = alpn
+                    self.state.tls["alpn"] = alpn
                 if version in {"TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"}:
                     self.state.addresses["tls_version"] = version
+                    self.state.tls["version"] = version
         except Exception:
             pass
         self.http2 = self.state.addresses.get("alpn") == "h2"
+        self.sample_tcp()
+
+    def sample_tcp(self):
+        try:
+            sock = self.inner.get_extra_info("socket")
+            if sock is None:
+                self.state.tcp = {"availability": "unavailable", "reason": "socket_unavailable"}
+            elif sys.platform == "darwin":
+                # Darwin netinet/tcp.h: TCP_CONNECTION_INFO, stable 112-byte prefix.
+                info = sock.getsockopt(socket.IPPROTO_TCP, 0x106, 112)
+                if len(info) < 112:
+                    self.state.tcp = {"availability": "unavailable", "reason": "unsupported_layout"}
+                    return
+                self.state.tcp = {
+                    "availability": "available",
+                    "timestamp": _utc(),
+                    "state": info[0],
+                    "rtt_ms": struct.unpack_from("=I", info, 44)[0],
+                    "tx_packets": struct.unpack_from("=Q", info, 56)[0],
+                    "tx_retransmit_bytes": struct.unpack_from("=Q", info, 72)[0],
+                    "rx_packets": struct.unpack_from("=Q", info, 80)[0],
+                    "rx_out_of_order_bytes": struct.unpack_from("=Q", info, 96)[0],
+                    "tx_retransmit_packets": struct.unpack_from("=Q", info, 104)[0],
+                }
+            elif sys.platform != "linux" or not hasattr(socket, "TCP_INFO"):
+                self.state.tcp = {"availability": "unavailable", "reason": "unsupported_platform"}
+            else:
+                info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+                if len(info) < 104:
+                    self.state.tcp = {"availability": "unavailable", "reason": "unsupported_layout"}
+                    return
+                self.state.tcp = {
+                    "availability": "available",
+                    "timestamp": _utc(),
+                    "state": info[0],
+                    "retransmits": info[2],
+                    "unacked": struct.unpack_from("=I", info, 24)[0],
+                    "rtt_us": struct.unpack_from("=I", info, 68)[0],
+                    "total_retrans": struct.unpack_from("=I", info, 100)[0],
+                }
+        except Exception:
+            self.state.tcp = {"availability": "unavailable", "reason": "probe_failed"}
+
+    def bind_current(self):
+        record = current_stream.get()
+        if record is not None and record.owner is self.state.owner:
+            self.state.bind(record)
 
     async def read(self, max_bytes, timeout=None):
+        self.bind_current()
         self.state.start("socket_read", timeout)
         try:
             data = await self.inner.read(max_bytes, timeout=timeout)
         except BaseException as error:
+            self.sample_tcp()
             self.state.end("socket_read", error=error)
             raise
         self.state.end("socket_read", size=len(data))
+        if not data:
+            self.sample_tcp()
+            self.state.close_evidence["read_eof"] = True
+            self.state.event("read_eof")
         if self.http2:
             self.state.observe_http2("inbound", data)
         return data
 
     async def write(self, buffer, timeout=None):
+        self.bind_current()
         self.state.start("socket_write", timeout)
         try:
             result = await self.inner.write(buffer, timeout=timeout)
         except BaseException as error:
+            self.sample_tcp()
             self.state.end("socket_write", error=error)
             raise
         self.state.end("socket_write", size=len(buffer))
@@ -766,6 +1236,8 @@ class InstrumentedStream(httpcore.AsyncNetworkStream):
         return result
 
     async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        self.bind_current()
+        self.state.event("tls_started")
         self.state.start("start_tls", timeout)
         try:
             stream = await self.inner.start_tls(
@@ -777,17 +1249,23 @@ class InstrumentedStream(httpcore.AsyncNetworkStream):
             self.state.end("start_tls", error=error)
             raise
         self.state.end("start_tls")
-        return InstrumentedStream(stream, state=self.state)
+        wrapped = InstrumentedStream(stream, state=self.state)
+        self.state.event("tls_complete")
+        return wrapped
 
     async def aclose(self):
+        self.state.observe_pool()
+        self.sample_tcp()
+        self.state.event("close_started")
         try:
             result = await self.inner.aclose()
         except BaseException as error:
-            self.state.error = exception_details(error)
+            self.state.failure("close", error)
             _emit("socket_close_failed", self.state.snapshot())
             raise
         if not self.state.closed:
             self.state.closed = True
+            self.state.event("close_complete")
             _emit("socket_closed", self.state.snapshot())
         return result
 

@@ -202,11 +202,7 @@ class RouteHealthMiddleware:
             client_port=(scope.get("client") or (None, None))[1],
             http_version=scope.get("http_version"),
         )
-        for name, value in scope.get("headers", ()):
-            if name.lower() == b"x-client-request-id":
-                if len(value) <= 64:
-                    diagnostic.bind_client_request_id(value.decode("ascii", errors="replace"))
-                break
+        diagnostic.bind_client_headers(scope.get("headers", ()))
         context_token = current_stream.set(diagnostic)
         status = 500
         is_sse = False

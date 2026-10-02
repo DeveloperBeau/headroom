@@ -2255,6 +2255,9 @@ class HeadroomProxy(
 
     async def shutdown(self):
         """Cleanup async resources."""
+        from headroom.proxy.upstream_diagnostics import diagnostics
+
+        diagnostics.shutdown()
         self._get_shutdown_event().set()
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()

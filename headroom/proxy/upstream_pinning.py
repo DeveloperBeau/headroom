@@ -69,7 +69,7 @@ from typing import Any
 import httpcore
 import httpx
 
-from headroom.proxy.upstream_diagnostics import instrument_stream
+from headroom.proxy.upstream_diagnostics import diagnostics, instrument_stream
 from headroom.proxy.upstream_guard import guarded_pin
 
 
@@ -234,6 +234,8 @@ def _install(transport: Any) -> tuple[Any, bool]:
     if isinstance(transport, GuardedUpstreamRefusingTransport):  # already installed
         return transport, False
     pool = getattr(transport, "_pool", None)
+    if pool is not None:
+        diagnostics.register_pool(pool)
     if pool is None:
         return (
             GuardedUpstreamRefusingTransport(
