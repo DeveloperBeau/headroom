@@ -84,7 +84,15 @@ class RouteHealthTests(unittest.IsolatedAsyncioTestCase):
         app = create_app(ProxyConfig(optimize=False, cache_enabled=False))
         self.assertIsInstance(app.state.route_health, RouteHealth)
         self.assertIn("/health/routes", {route.path for route in app.routes})
-        self.assertIs(app.user_middleware[0].cls, RouteHealthMiddleware)
+        # RouteHealth must wrap every BaseHTTPMiddleware security gate, because a
+        # gate can consume a client disconnect. ActivityMiddleware stays outermost.
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        classes = [middleware.cls for middleware in app.user_middleware]
+        position = classes.index(RouteHealthMiddleware)
+        gates = [i for i, cls in enumerate(classes) if issubclass(cls, BaseHTTPMiddleware)]
+        self.assertTrue(gates)
+        self.assertLess(position, min(gates))
 
     async def test_disconnect_consumed_by_security_gate_is_observed(self):
         from fastapi import FastAPI

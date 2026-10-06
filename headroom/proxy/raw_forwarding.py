@@ -10,6 +10,7 @@ import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.upstream_diagnostics import current_stream
 
 logger = logging.getLogger("headroom.proxy")
@@ -107,7 +108,6 @@ async def forward_raw(
         from headroom.proxy.handlers.openai import (
             _CODEX_RESPONSES_LITE_HEADER,
             _append_request_query,
-            _openai_rate_limit_key,
             _resolve_openai_handler_path,
             _resolve_openai_upstream_base,
         )
@@ -147,11 +147,9 @@ async def forward_raw(
             for key, value in headers.items()
             if key.lower() != _CODEX_RESPONSES_LITE_HEADER
         }
-        rate_key = _openai_rate_limit_key(headers)
         provider = "openai"
     else:
         from headroom.proxy.anthropic_wire import build_anthropic_upstream_url
-        from headroom.proxy.forwarded_headers import resolve_client_ip
 
         url = build_anthropic_upstream_url(
             proxy.ANTHROPIC_API_URL, request.url.path, request.url.query
@@ -160,15 +158,11 @@ async def forward_raw(
             headers, proxy.config.anthropic_extra_headers, upstream_url=None, config=proxy.config
         )
         headers = {key.lower(): value for key, value in headers.items()}
-        key = headers.get("x-api-key", "")
-        authorization = headers.get("authorization", "")
-        if not key and authorization.startswith("Bearer "):
-            key = authorization[7:]
-        client_ip = resolve_client_ip(request) or "unknown"
-        rate_key = f"{key[:16]}:{client_ip}" if key else client_ip
         provider = "anthropic"
 
     if proxy.rate_limiter:
+        # The handlers use the same identity rule (headroom/proxy/rate_limit_identity.py).
+        rate_key = rate_limit_identity(request, headers)
         allowed, wait_seconds = await proxy.rate_limiter.check_request(rate_key)
         if not allowed:
             await proxy.metrics.record_rate_limited(provider=provider, source="headroom")
