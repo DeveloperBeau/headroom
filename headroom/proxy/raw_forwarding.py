@@ -10,6 +10,7 @@ import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from headroom.offline import OfflineEgressBlocked
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.upstream_diagnostics import current_stream
 
@@ -43,6 +44,11 @@ def raw_forwarding_allowed(proxy, route: str) -> bool:
     return route != "messages" or not (
         getattr(proxy, "security", None) or getattr(proxy, "anthropic_backend", None)
     )
+
+
+async def _single_chunk(content: bytes) -> AsyncIterable[bytes]:
+    if content:
+        yield content
 
 
 class _RawResponse(StreamingResponse):
@@ -208,6 +214,9 @@ async def forward_raw(
     )
     try:
         upstream = await proxy.http_client.send(upstream_request, stream=True)
+    except OfflineEgressBlocked:
+        # An air-gap refusal must not become a 502 or a diagnostic event.
+        raise
     except BaseException as error:
         if diagnostic is not None:
             diagnostic.observe_exception(error)
@@ -232,7 +241,13 @@ async def forward_raw(
 
     async def relay():
         try:
-            chunks = upstream.aiter_raw()
+            # A response built from in-memory content is already read, so
+            # aiter_raw would raise StreamConsumed. Network responses stream.
+            chunks = (
+                _single_chunk(upstream.content)
+                if getattr(upstream, "is_stream_consumed", False)
+                else upstream.aiter_raw()
+            )
             if diagnostic is not None:
                 chunks = diagnostic.iter_chunks(chunks)
             async for chunk in chunks:

@@ -4175,7 +4175,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # The handlers keep their own streaming check — this layer exists so that
     # an extension middleware reading the body is bounded too, and so a
     # declared oversize Content-Length is refused before any body is read.
-    app.add_middleware(RequestBodyLimitMiddleware)
+    # Without extensions, the handlers own the ceiling: they refuse an
+    # oversized body, or stream it to the provider unparsed when raw
+    # forwarding applies (large_request_body.py). A global refusal here would
+    # block that media upload path.
+    if getattr(config, "proxy_extensions", None):
+        app.add_middleware(RequestBodyLimitMiddleware)
 
     # Delegates so the HTTP gate and WebSocketAuthMiddleware read a credential
     # by exactly one rule; they guard the same token on two transports.

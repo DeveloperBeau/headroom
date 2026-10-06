@@ -386,6 +386,16 @@ def test_body_ceiling_413_uses_bedrock_handler_dialect(monkeypatch, route):
     http.send.assert_not_called()
 
 
+class _AllowingTokenLimiter:
+    tokens_per_minute = 100_000
+
+    async def check_request(self, _rate_key):
+        return True, 0.0
+
+    async def check_tokens(self, _rate_key, _tokens):
+        return True, 0.0
+
+
 def test_body_ceiling_413_leaves_other_dialects_unchanged(monkeypatch):
     """The dialect fix is scoped to the Bedrock InvokeModel routes: ``/v1/messages``
     keeps the Anthropic envelope and OpenAI chat keeps
@@ -401,6 +411,10 @@ def test_body_ceiling_413_leaves_other_dialects_unchanged(monkeypatch):
         proxy = client.app.state.proxy
         http = _install_fake_client(proxy, _FakeUpstream())
         proxy.anthropic_pipeline.apply = MagicMock(side_effect=AssertionError("should not run"))
+        # The fork streams an oversized upload to the provider when raw
+        # forwarding applies. A token limit needs the parsed body, so the
+        # handler refuses the upload and this test checks the 413 dialect.
+        proxy.rate_limiter = _AllowingTokenLimiter()
         oversized = b"x" * (small_cap * 4)
         messages = client.post(
             "/v1/messages",

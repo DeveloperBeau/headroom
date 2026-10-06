@@ -963,6 +963,13 @@ class _RateLimiterDeny:
         return False, 1.0
 
 
+class _RateLimiterTokenBudget:
+    tokens_per_minute = 100_000
+
+    async def check_request(self, _rate_key):
+        return True, 0.0
+
+
 class _CostTrackerBlock:
     def check_budget(self):
         return False, 0
@@ -1045,6 +1052,9 @@ def test_early_exit_paths_release_semaphore_under_contention(scenario):
         headers = {"authorization": "Bearer sk-ant-api-test"}
         if scenario == "oversized_body":
             headers["content-length"] = str(MAX_REQUEST_BODY_SIZE + 1)
+            # A token limit needs the parsed body, so raw forwarding cannot
+            # take the oversized upload and the handler refuses it with 413.
+            handler.rate_limiter = _RateLimiterTokenBudget()
         elif scenario == "invalid_json":
             body = b"{not json"
         elif scenario == "too_many_messages":
