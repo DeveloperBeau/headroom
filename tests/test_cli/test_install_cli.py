@@ -1009,6 +1009,8 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     new_manifest = Manifest("default", ["claude"])
     existing_manifest = Manifest("default", ["codex"])
     existing_manifest.mutations = [object()]
+    # Do not depend on whether a real process listens on the fixture port.
+    monkeypatch.setattr("headroom.install.runtime._port_accepting", lambda host, port: False)
 
     monkeypatch.setattr("headroom.cli.install.build_manifest", lambda **_: new_manifest)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: existing_manifest)

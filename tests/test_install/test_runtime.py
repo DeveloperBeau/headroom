@@ -55,6 +55,7 @@ def test_wait_stopped_waits_for_health_endpoint_to_go_down(monkeypatch) -> None:
     probe_results = iter([True, True, False])
     sleeps: list[float] = []
     monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: next(probe_results))
+    monkeypatch.setattr("headroom.install.runtime._port_accepting", lambda host, port: False)
     monkeypatch.setattr(
         "headroom.install.runtime.time.sleep", lambda seconds: sleeps.append(seconds)
     )
@@ -73,6 +74,36 @@ def test_wait_stopped_times_out_when_endpoint_keeps_answering(monkeypatch) -> No
     )
 
     assert wait_stopped(_wait_stopped_manifest(), timeout_seconds=2) is False
+
+
+def test_wait_stopped_waits_for_stalled_process_to_release_port(monkeypatch) -> None:
+    """A stalled process fails the health probe but still holds its listener."""
+
+    port_results = iter([True, True, True, False])
+    sleeps: list[float] = []
+    monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: False)
+    monkeypatch.setattr(
+        "headroom.install.runtime._port_accepting", lambda host, port: next(port_results)
+    )
+    monkeypatch.setattr(
+        "headroom.install.runtime.time.sleep", lambda seconds: sleeps.append(seconds)
+    )
+
+    assert wait_stopped(_wait_stopped_manifest(), timeout_seconds=5) is True
+    assert len(sleeps) == 3
+
+
+def test_port_accepting_distinguishes_listener_from_refusal() -> None:
+    import socket
+
+    from headroom.install.runtime import _port_accepting
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        assert _port_accepting("127.0.0.1", port) is True
+    assert _port_accepting("127.0.0.1", port) is False
 
 
 def test_build_runtime_command_for_docker_includes_deployment_env(

@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from headroom._subprocess import pid_alive, run
 
@@ -648,11 +650,33 @@ def runtime_ready(manifest: DeploymentManifest) -> bool:
         return False
 
 
-def wait_stopped(manifest: DeploymentManifest, timeout_seconds: int = 15) -> bool:
-    """Wait for the deployment's health endpoint to stop answering."""
+def _port_accepting(host: str, port: int) -> bool:
+    """Return True unless the port refuses a TCP connection.
 
+    A stalled process fails the health probe but its listener still accepts
+    connections. Only a refusal proves that the old process released the port.
+    """
+
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except ConnectionRefusedError:
+        return False
+    except OSError:
+        return True
+
+
+def wait_stopped(manifest: DeploymentManifest, timeout_seconds: int = 30) -> bool:
+    """Wait until the health endpoint stops answering and the port is released.
+
+    The default timeout covers launchd's 20 second exit timeout, after which
+    launchd sends SIGKILL to a process that ignores SIGTERM.
+    """
+
+    health = urlsplit(manifest.health_url)
+    host, port = health.hostname or "127.0.0.1", health.port or 80
     deadline = time.monotonic() + timeout_seconds
-    while probe_ready(manifest.health_url):
+    while probe_ready(manifest.health_url) or _port_accepting(host, port):
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.25)
